@@ -874,6 +874,467 @@ def test_defense_cli_smoke():
         assert p.returncode == 0 and "eapol" in p.stdout.lower()
 
 
+# ------------------------------------------------- trust model (#1, #9)
+
+def test_trust_binding_confidence_ordering():
+    from wifiscanner.trust import binding_confidence
+    single, _, _ = binding_confidence(["single-frame"])
+    unidir, _, _ = binding_confidence(["data-unidir"])
+    bidi, _, _ = binding_confidence(["data-bidi"])
+    assoc, _, _ = binding_confidence(["assoc-request"])
+    table, _, _ = binding_confidence(["assoc-table"])
+    assert single < unidir < bidi < assoc <= table
+    assert table >= 95
+    # corroboration boosts: assoc + eapol + bidi beats assoc alone
+    fused, best, note = binding_confidence(
+        ["assoc-request", "eapol", "data-bidi"])
+    assert fused > assoc and best == "assoc-request"
+    assert "corroborated" in note
+
+
+def test_trust_combine_confidence():
+    from wifiscanner.trust import combine_confidence
+    assert combine_confidence([]) == 0
+    assert combine_confidence([50]) == 50
+    both = combine_confidence([50, 50])
+    assert both == 75  # noisy-OR: 1 - 0.5*0.5
+    assert combine_confidence([99, 99]) <= 99  # never manufactures certainty
+    assert combine_confidence([20, 25, 45]) > 45
+
+
+def test_station_evidence_and_binding():
+    from wifiscanner.models import Station
+    s = Station(mac="AC:BC:32:01:02:03")
+    s.observe(-60, data=True, length=100, source="monitor", direction="up")
+    assert "data-unidir" in s.evidence_kinds
+    assert s.binding_confidence < 85
+    s.observe(-58, data=True, length=100, source="monitor", direction="down")
+    assert "data-bidi" in s.evidence_kinds  # upgraded by 2nd direction
+    assert s.binding_confidence >= 85
+    assert "monitor-rf" in s.sources
+    s.confirmed = True
+    assert s.binding_confidence >= 95
+    assert s.binding_kind == "assoc-table"
+
+
+def test_census_rf_vs_confirmed():
+    from wifiscanner.models import AccessPoint, Station
+    e = Engine()
+    ap = AccessPoint(bssid="AA:BB:CC:DD:EE:FF", ssid="Own", security=["WPA2"],
+                     channel=6, frequency=2437, rssi=-50)
+    rf = Station(mac="AC:BC:32:01:02:03")
+    rf.observe(-60, data=True, source="monitor", direction="up")
+    ap.add_station(rf)
+    e.ingest([ap])
+    assert ap.census["rf_only"] == 1 and ap.census["router_confirmed"] == 0
+    assert "estimate" in ap.census_note  # RF-only counts say estimate, not fact
+    # router table confirms the SAME mac -> correlated, not double-counted
+    table_sta = Station(mac="AC:BC:32:01:02:03", ip_address="192.168.1.5")
+    e.ingest_lan([table_sta], bssid_hint="AA:BB:CC:DD:EE:FF",
+                 authoritative=True)
+    assert ap.client_count == 1, "correlation must not duplicate the client"
+    assert ap.census["router_confirmed"] == 1 and ap.census["rf_only"] == 0
+    assert ap.stations["AC:BC:32:01:02:03"].ip_address == "192.168.1.5"
+    s = e.summary()
+    assert s["connected_devices_confirmed"] == 1
+    assert s["connected_devices_rf_only"] == 0
+
+
+# ------------------------------------------------- randomized MACs (#2)
+
+def test_identity_report_range():
+    from wifiscanner.models import AccessPoint, Station
+    e = Engine()
+    ap = AccessPoint(bssid="AA:BB:CC:DD:EE:FF", ssid="N")
+    ap.add_station(Station(mac="AC:BC:32:01:02:03"))  # stable
+    ap.add_station(Station(mac="0A:1B:2C:3D:4E:5F", is_randomized=True))
+    ap.add_station(Station(mac="9E:12:34:56:78:9A", is_randomized=True))
+    e.ingest([ap])
+    rep = e.identity_report()
+    assert rep["stable_macs"] == 1 and rep["rotating_macs"] == 2
+    assert rep["estimated_devices_min"] == 2   # stable + >=1 rotating device
+    assert rep["estimated_devices_max"] == 3
+    assert "not verified devices" in rep["note"]
+    from wifiscanner.oui import classify_mac
+    cls, note = classify_mac("0A:1B:2C:3D:4E:5F")
+    assert cls == "rotating-privacy-mac" and "with each other" in note
+    assert classify_mac("AC:BC:32:01:02:03")[0] == "stable-mac"
+    assert classify_mac("FF:FF:FF:FF:FF:FF")[0] == "multicast"
+
+
+def test_randomized_identity_note_honesty():
+    from wifiscanner.models import Station
+    s = Station(mac="0A:1B:2C:3D:4E:5F", is_randomized=True)
+    assert s.identity_class == "rotating-privacy-mac"
+    # must disclaim BOTH directions of the unknowable claim
+    assert "same physical device" in s.identity_note
+
+
+# ------------------------------------------------- rogue scoring (#8)
+
+def test_rogue_requires_multiple_indicators():
+    from wifiscanner.models import AccessPoint
+    e = Engine()
+    # single indicator only (vendor differs, same crypto): NOT rogue
+    e.ingest([AccessPoint(bssid="F0:9F:C2:00:00:01", ssid="Corp",
+                          vendor="Ubiquiti", security=["WPA2"]),
+              AccessPoint(bssid="24:A4:3C:00:00:02", ssid="Corp",
+                          vendor="Ubiquiti-2", security=["WPA2"])])
+    rows = e.rogue_candidates()
+    assert len(rows) == 1
+    assert rows[0]["verdict"].startswith("unconfirmed")
+    assert rows[0]["severity"] == "low"
+    assert rows[0]["indicator_count"] == 1
+    assert e.summary()["rogue_alerts"] == 0  # unconfirmed never counts
+    assert e.summary()["rogue_unconfirmed"] == 1
+
+
+def test_rogue_open_clone_confirmed():
+    from wifiscanner.models import AccessPoint
+    e = Engine()
+    e.ingest([AccessPoint(bssid="F0:9F:C2:00:00:01", ssid="Cafe",
+                          vendor="Ubiquiti", security=["WPA2"]),
+              AccessPoint(bssid="00:11:22:33:44:55", ssid="Cafe",
+                          vendor="Evil Inc", security=["OPEN"])])
+    rows = e.rogue_candidates()
+    assert len(rows) == 1 and rows[0]["verdict"] == "likely-rogue"
+    assert rows[0]["severity"] == "high"
+    assert rows[0]["indicator_count"] >= 2
+    assert "open-clone" in rows[0]["indicators"]
+    assert e.summary()["rogue_alerts"] == 1
+
+
+def test_rogue_warden_indicator():
+    from wifiscanner.models import AccessPoint
+    e = Engine()
+    e.ingest([AccessPoint(bssid="AA:BB:CC:00:00:01", ssid="Home",
+                          vendor="V1", security=["WPA2"]),
+              AccessPoint(bssid="AA:BB:CC:00:00:02", ssid="Home",
+                          vendor="V2", security=["WPA2"])])
+    plain = e.rogue_candidates()
+    assert plain[0]["indicator_count"] == 1
+    with_warden = e.rogue_candidates(known_bssids={"AA:BB:CC:00:00:01"})
+    assert "warden-unknown" in with_warden[0]["indicators"]
+    assert with_warden[0]["indicator_count"] == 2
+
+
+# ------------------------------------------------- privacy core (#3)
+
+def test_privacy_hash_mac():
+    from wifiscanner.privacy import hash_mac, is_pseudonym
+    a1 = hash_mac("AC:BC:32:01:02:03", "salt-1")
+    a2 = hash_mac("ac:bc:32:01:02:03", "salt-1")
+    b = hash_mac("AC:BC:32:01:02:03", "salt-2")
+    assert a1 == a2  # deterministic -> sessions still group
+    assert a1 != b   # different salts unlinkable
+    assert is_pseudonym(a1) and not is_pseudonym("AC:BC:32:01:02:03")
+    assert "AC:BC" not in a1  # irreversible
+
+
+def test_privacy_redaction_helpers():
+    from wifiscanner.privacy import (mask_ip, redact_url, redact_user_agent,
+                                     scrub_credentials)
+    u = redact_url("/login?user=alice&password=hunter2&gclid=abc")
+    assert "hunter2" not in u and "password" not in u and "/login" in u
+    assert redact_user_agent(b"TestAgent/1.0 (Linux; x86_64)") == "TestAgent"
+    assert mask_ip("192.168.1.55") == "192.168.1.0/24"
+    assert scrub_credentials("auth=hunter2 ok") == "auth=[REDACTED] ok"
+
+
+def test_secure_file_permissions(tmp=None):
+    import stat as _stat
+    from wifiscanner.privacy import (check_file_access, ensure_secure_storage,
+                                     secure_file)
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "s.pcap")
+        with open(p, "wb") as fh:
+            fh.write(b"0" * 64)
+        os.chmod(p, 0o644)
+        assert "readable by other users" in check_file_access(p)
+        assert secure_file(p)
+        assert _stat.S_IMODE(os.stat(p).st_mode) == 0o600
+        assert ensure_secure_storage(p) == ""
+
+
+# ------------------------------------------------- store privacy (#3, #10)
+
+def test_store_retention_and_perms():
+    import stat as _stat
+    from wifiscanner.store import Store
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "r.sqlite")
+        st = Store(db, retention_days=7)
+        st.record_engine(_synthetic_engine(), sensor="s")
+        st.close()
+        assert _stat.S_IMODE(os.stat(db).st_mode) == 0o600
+        # age every row 8 days, reopen -> retention must auto-prune
+        st = Store(db, retention_days=90)  # reopen without pruning first
+        with st.db:
+            for t in ("scans", "networks", "devices", "observations"):
+                st.db.execute(f"UPDATE {t} SET ts = ts - 8*86400")
+        st.close()
+        st = Store(db, retention_days=7)
+        try:
+            assert st.stats()["devices"]["rows"] == 0
+            assert st.stats()["observations"]["rows"] == 0
+        finally:
+            st.close()
+
+
+def test_store_delete_and_anonymize():
+    from wifiscanner.privacy import is_pseudonym
+    from wifiscanner.store import Store
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "e.sqlite")
+        st = Store(db)
+        st.record_engine(_synthetic_engine(), sensor="s")
+        n = st.delete_device("AC:BC:32:00:00:00")
+        assert n >= 2  # devices + observations rows
+        assert st.device_history("AC:BC:32:00:00:00") == []
+        m = st.anonymize_history()
+        assert m > 0
+        macs = [r["mac"] for r in st.known_devices()]
+        assert macs and all(is_pseudonym(x) for x in macs)
+        # PII columns wiped
+        row = st.db.execute("SELECT ip, hostname FROM devices").fetchone()
+        assert row["ip"] == "" and row["hostname"] == ""
+        st.close()
+
+
+def test_store_ephemeral_refuses_and_minimal_writes():
+    from wifiscanner.privacy import is_pseudonym
+    from wifiscanner.store import Store
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            Store(os.path.join(td, "x.sqlite"), privacy_mode="ephemeral")
+            assert False, "ephemeral must refuse persistence"
+        except PermissionError:
+            pass
+        assert not os.path.exists(os.path.join(td, "x.sqlite"))
+        db = os.path.join(td, "m.sqlite")
+        st = Store(db, privacy_mode="minimal")
+        eng = _synthetic_engine()
+        for ap in eng.aps.values():
+            for s in ap.stations.values():
+                s.ip_address, s.hostname = "192.168.1.9", "alice-laptop"
+        st.record_engine(eng, sensor="s")
+        rows = st.db.execute("SELECT mac, ip, hostname FROM devices").fetchall()
+        assert rows and all(is_pseudonym(r["mac"]) for r in rows)
+        assert all(r["ip"] == "" and r["hostname"] != "alice-laptop"
+                   for r in rows)
+        st.close()
+
+
+# ------------------------------------------------- IDS trust (#7)
+
+def test_ids_confidence_evidence_status():
+    from wifiscanner.defense import Watchdog
+    ap, sta, deauth, beacon, assoc, eapol = _mgmt_frames()
+    wd = Watchdog(window_s=60, cooldown_s=0)
+    for _ in range(6):
+        wd.feed(deauth())
+    floods = [a for a in wd.alerts if a.kind == "deauth-flood"]
+    assert floods and floods[0].confidence > 0
+    assert floods[0].evidence and floods[0].status == "unconfirmed"
+    assert "to confirm" in floods[0].detail  # corroboration guidance attached
+    assert floods[0].to_row()["confidence_label"] in (
+        "low", "medium", "high", "very-low")
+    wd.feed(assoc())
+    wd.feed(eapol())
+    by_kind = {a.kind: a for a in wd.alerts}
+    assert by_kind["forced-reauth"].status == "corroborated"
+    assert by_kind["handshake-harvest-signature"].status == "confirmed"
+    assert by_kind["handshake-harvest-signature"].confidence == 95
+    # the flood got upgraded by the completed chain
+    assert by_kind["deauth-flood"].status == "corroborated"
+
+
+def test_ids_sensitivity_scaling():
+    from wifiscanner.defense import Watchdog
+    assert Watchdog(flood_frames=5, sensitivity="low").effective_flood_n == 10
+    assert Watchdog(flood_frames=5, sensitivity="medium").effective_flood_n == 5
+    assert Watchdog(flood_frames=5, sensitivity="high").effective_flood_n == 3
+
+
+def test_ids_beacon_persistence_upgrades():
+    from wifiscanner.defense import Watchdog
+    ap, sta, deauth, beacon, assoc, eapol = _mgmt_frames()
+    wd = Watchdog(cooldown_s=0)
+    wd.feed(beacon(channel=6))
+    wd.feed(beacon(channel=11, rsn=False))
+    first = [a for a in wd.alerts if a.kind == "beacon-mutation"]
+    assert first and first[0].confidence < 60  # single sighting: weak
+    wd.feed(beacon(channel=11, rsn=False))
+    wd.feed(beacon(channel=11, rsn=False))     # 3rd sighting persists
+    best = max(a.confidence for a in wd.alerts if a.kind == "beacon-mutation")
+    assert best >= 75
+
+
+def test_ids_adaptive_margin_in_noisy_air():
+    from wifiscanner.defense import Watchdog
+    from scapy.all import RadioTap, Dot11
+    from scapy.layers.dot11 import Dot11Deauth
+    wd = Watchdog(window_s=60, cooldown_s=0)
+    assert wd._adaptive_margin() == 0
+    for i in range(3):  # deauths on 3 different BSSIDs: noisy for everyone
+        for _ in range(2):
+            wd.feed(RadioTap() / Dot11(type=0, subtype=12,
+                                       addr1="AA:BB:CC:DD:EE:FF",
+                                       addr2=f"00:11:22:00:00:0{i}",
+                                       addr3=f"00:11:22:00:00:0{i}")
+                    / Dot11Deauth(reason=7))
+    assert wd._adaptive_margin() == 2
+
+
+# ------------------------------------------------- locate honesty (#4)
+
+def test_locate_confidence_and_zone_primary():
+    from wifiscanner.locate import (Fix, Sensor, Tracker, fix_confidence,
+                                    zone_at, Zone)
+    c, zc = fix_confidence("nearest-sensor", None, 1, 20.0)
+    assert (c, zc) == ("low", "medium")
+    c, zc = fix_confidence("trilateration", 1.0, 4, 20.0)
+    assert c == "high"  # small error on a big grid with 4 sensors
+    c, _ = fix_confidence("trilateration", 30.0, 3, 20.0)
+    assert c == "low"   # error bigger than the grid: not precise
+    f = Fix(0.0, "AA", 1.0, 2.0, 30.0, "nearest-sensor(guarded)",
+            "3sensors:a", zone="kitchen", confidence="low",
+            zone_confidence="medium")
+    assert not f.precise_ok
+    assert "zone 'kitchen' only" in f.display and "withheld" in f.display
+    assert f.error_radius_m == 30.0
+    # Tracker attaches the metadata end to end
+    sensors = [Sensor("S1", 1, 1), Sensor("S2", 9, 1), Sensor("S3", 5, 9)]
+    tr = Tracker(sensors, [Zone("living", [(0, 0), (10, 0), (10, 10), (0, 10)])])
+    fixes = tr.fixes([{"ts": 1000.0 + i, "sensor": f"S{(i % 3) + 1}",
+                       "mac": "AA", "rssi": -50, "freq": 2437}
+                      for i in range(3)])
+    assert fixes and fixes[0].confidence in ("high", "medium", "low")
+    assert fixes[0].to_row()["display"]
+
+
+# ------------------------------------------------- traffic redaction (#6)
+
+def test_traffic_redaction_by_default():
+    from scapy.all import Ether, IP, Raw, TCP
+    from wifiscanner.traffic import Dissector
+    d = Dissector()  # redact=True default
+    http = (b"GET /search?q=alice+medical+results&sessionid=abc123 HTTP/1.1\r\n"
+            b"Host: example.com\r\nUser-Agent: Mozilla/5.0 (X11; Linux)\r\n\r\n")
+    d.feed(Ether() / IP(src="192.168.1.10", dst="93.184.216.34")
+           / TCP(sport=5301, dport=80) / Raw(load=http))
+    ev = d.events[-1]
+    assert "medical" not in ev.summary and "sessionid" not in ev.summary
+    assert "/search" in ev.summary  # path kept for audit value
+    assert "Mozilla" in ev.detail and "X11" not in ev.detail
+    assert d.stats()["redactions"] >= 1
+    d2 = Dissector(redact=False)
+    d2.feed(Ether() / IP(src="192.168.1.10", dst="93.184.216.34")
+            / TCP(sport=5301, dport=80) / Raw(load=http))
+    assert "sessionid=abc123" in d2.events[-1].summary  # explicit opt-out only
+
+
+def test_traffic_anonymize_ips():
+    from scapy.all import Ether, IP, UDP, DNS, DNSQR
+    from wifiscanner.traffic import Dissector
+    d = Dissector(anonymize_ips=True)
+    d.feed(Ether() / IP(src="192.168.1.10", dst="192.168.1.1")
+           / UDP(sport=5300, dport=53) / DNS(qd=DNSQR(qname="example.com")))
+    assert d.events[0].src.startswith("192.168.1.0/24")
+
+
+# ------------------------------------------------- capture guardrail (#5)
+
+def test_capture_requires_explicit_ack():
+    root = os.path.dirname(HERE)
+    p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                        "capture", "-d", "1"],
+                       cwd=root, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2
+    assert "ack-sensitive" in (p.stderr + p.stdout)
+    p = subprocess.run([sys.executable, "main.py", "capture", "--help"],
+                       cwd=root, capture_output=True, text=True, timeout=60)
+    assert "--strip-payloads" in p.stdout and "--ack-sensitive" in p.stdout
+
+
+def test_db_command_report_and_prune():
+    root = os.path.dirname(HERE)
+    env = dict(os.environ, COLUMNS="220")
+    if not os.path.exists(FIXTURE):
+        subprocess.run([sys.executable, "tests/make_fixture.py"], cwd=root,
+                       check=True, capture_output=True)
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.sqlite")
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "record", "--db", db, "--pcap",
+                            os.path.relpath(FIXTURE, root)],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=180, env=env)
+        assert p.returncode == 0, p.stderr[:500]
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "db", "--db", db, "--report"],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=60, env=env)
+        assert p.returncode == 0, p.stderr[:500]
+        assert "retention" in p.stdout.lower()
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "db", "--db", db, "--prune-days", "365"],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=60, env=env)
+        assert p.returncode == 0, p.stderr[:500]
+        assert "pruned" in p.stdout
+
+
+def test_db_destructive_needs_yes():
+    root = os.path.dirname(HERE)
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "d.sqlite")
+        from wifiscanner.store import Store
+        Store(db).close()
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "db", "--db", db, "--anonymize-db"],
+                           cwd=root, capture_output=True, text=True, timeout=60)
+        assert p.returncode == 2 and "--yes" in (p.stderr + p.stdout)
+
+
+# ------------------------------------------------- export privacy (#3)
+
+def test_export_anonymize_option():
+    from wifiscanner.privacy import is_pseudonym
+    with tempfile.TemporaryDirectory() as td:
+        files = export_all(_synthetic_engine(), td, "anon", ("csv",),
+                           anonymize=True, salt="test-salt")
+        with open(os.path.join(td, "anon_devices.csv"),
+                  encoding="utf-8-sig") as fh:
+            rows = list(csv.DictReader(fh))
+        assert rows and all(is_pseudonym(r["mac"]) for r in rows)
+        assert all(r["ip_address"] == "" and r["probed_ssids"] == ""
+                   for r in rows)
+        assert "binding_confidence" in rows[0] and "sources" in rows[0]
+        with open(os.path.join(td, "anon_networks.csv"),
+                  encoding="utf-8-sig") as fh:
+            nrows = list(csv.DictReader(fh))
+        assert "census_confidence" in nrows[0]
+        assert "census_note" in nrows[0]
+
+
+def test_ids_cli_shows_confidence():
+    root = os.path.dirname(HERE)
+    env = dict(os.environ, COLUMNS="220")
+    with tempfile.TemporaryDirectory() as td:
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "ids", "--pcap", os.path.relpath(FIXTURE, root),
+                            "--sensitivity", "low", "-o", td],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=180, env=env)
+        assert p.returncode == 0, p.stderr[:500]
+        assert "sensitivity: low" in p.stdout
+        # low sensitivity doubles the flood threshold to 10, so the fixture's
+        # 9-frame burst correctly produces NO alert (fewer, surer alerts)
+        assert not glob.glob(os.path.join(td, "ids_alerts.csv"))
+        assert "watchdog:" in p.stdout
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

@@ -52,14 +52,40 @@ class Flow:
 
 
 class Dissector:
-    """Feed frames in, get protocol events + flows out."""
+    """Feed frames in, get protocol events + flows out.
 
-    def __init__(self):
+    Weakness #6 (traffic-analysis exposure): collection is metadata-minimal
+    by default and redaction is ON unless explicitly disabled:
+
+    * HTTP: URL query strings/fragments stripped, User-Agent reduced to its
+      product token, POST bodies and Authorization values NEVER logged.
+    * DNS: query names truncated; response addresses capped.
+    * DHCP: hostnames truncated (owner names leak through them).
+    * ``anonymize_ips`` additionally masks IPs to /24 (off by default so
+      flows still correlate on your own network; enable for shared reports).
+    """
+
+    def __init__(self, redact: bool = True, anonymize_ips: bool = False,
+                 max_detail: int = 150):
         self.events: List[Event] = []
         self.flows: Dict[Tuple, Flow] = {}
         self.protected_skipped = 0
         self.frames_seen = 0
         self.ip_frames = 0
+        self.redact = redact
+        self.anonymize_ips = anonymize_ips
+        self.max_detail = max_detail
+        self.redactions = 0
+
+    def _ip(self, ip: str) -> str:
+        if self.anonymize_ips and ip:
+            from .privacy import mask_ip
+            # keep "ip:port" shape — mask the host part only
+            if ":" in ip and ip.count(":") == 1:
+                host, _, port = ip.partition(":")
+                return f"{mask_ip(host)}:{port}"
+            return mask_ip(ip)
+        return ip
 
     def _emit(self, ev: Event) -> Event:
         self.events.append(ev)
@@ -146,6 +172,9 @@ class Dissector:
                    len(bytes(l3)), ts, flags)
 
         ev: Optional[Event] = None
+        from .privacy import (redact_hostname_in_text, redact_url,
+                              redact_user_agent, scrub_credentials, truncate)
+        sip_r, dip_r = self._ip(sip), self._ip(dip)
         # --- DNS (UDP/TCP 53)
         if l4.haslayer(DNS) and (sport == 53 or dport == 53):
             dns = l4[DNS]
@@ -165,13 +194,17 @@ class Dissector:
             ans = ""
             if dns.an and hasattr(dns.an, "rdata"):
                 try:
-                    ans = " -> " + ",".join(
-                        str(r.rdata) for r in _iter_rr(dns.an))[:120]
+                    rdata = ",".join(str(r.rdata) for r in _iter_rr(dns.an))
+                    if self.anonymize_ips:
+                        from .privacy import mask_ip as _m
+                        rdata = ",".join(_m(x.strip()) for x in rdata.split(","))
+                    ans = " -> " + rdata[:120]
                 except Exception:
                     ans = ""
             qtype = "query" if dns.qr == 0 else "response"
-            ev = Event(ts, src_mac, dst_mac, f"{sip}:{sport}", f"{dip}:{dport}",
-                       "DNS", f"{qtype} {','.join(names)[:150]}{ans}")
+            summary = f"{qtype} {','.join(names)[:150]}{ans}"
+            ev = Event(ts, src_mac, dst_mac, f"{sip_r}:{sport}", f"{dip_r}:{dport}",
+                       "DNS", truncate(scrub_credentials(summary), self.max_detail))
             joined = " ".join(names).lower()
             if any(k in joined for k in ("gstatic.com/generate_204", "detective",
                                          "connectivitycheck", "captive.apple",
@@ -196,14 +229,26 @@ class Dissector:
                     alert = "cleartext-credentials"   # values intentionally NOT logged
                 elif b"Authorization: Basic" in head:
                     alert = "cleartext-basic-auth"
-                ev = Event(ts, src_mac, dst_mac, f"{sip}:{sport}", f"{dip}:{dport}",
-                           "HTTP", f"{method} {url[:120]} host={host[:60] or '?'}",
-                           f"ua={ua.decode(errors='replace')}" if ua else "", alert)
+                if self.redact:
+                    url = redact_url(url)
+                    self.redactions += 1
+                else:
+                    url = url[:120]
+                ua_s = redact_user_agent(ua) if self.redact else \
+                    ua.decode(errors="replace")
+                ev = Event(ts, src_mac, dst_mac, f"{sip_r}:{sport}", f"{dip_r}:{dport}",
+                           "HTTP", truncate(f"{method} {url} host={host[:60] or '?'}",
+                                            self.max_detail),
+                           truncate(f"ua={ua_s}" if ua_s else "", self.max_detail),
+                           alert)
         # --- TLS ClientHello SNI (plaintext metadata only)
         if (dport == 443 or sport == 443) and payload[:1] == b"\x16":
             sni = tls_sni(payload)
             if sni:
-                ev = Event(ts, src_mac, dst_mac, f"{sip}:{sport}", f"{dip}:443",
+                if self.redact and len(sni) > 80:
+                    sni = sni[:80] + "…"
+                    self.redactions += 1
+                ev = Event(ts, src_mac, dst_mac, f"{sip_r}:{sport}", f"{dip_r}:443",
                            "TLS-SNI", f"ClientHello sni={sni}",
                            "encrypted-payload-skipped")
         # --- DHCP hostnames
@@ -212,8 +257,11 @@ class Dissector:
             hostn = dhcp_hostname(b)
             ciaddr = getattr(b, "yiaddr", "")
             if hostn:
-                ev = Event(ts, src_mac, dst_mac, sip, dip, "DHCP",
-                           f"lease yiaddr={ciaddr} hostname={hostn}")
+                if self.redact:
+                    hostn = redact_hostname_in_text(hostn)
+                ev = Event(ts, src_mac, dst_mac, sip_r, dip_r, "DHCP",
+                           truncate(f"lease yiaddr={ciaddr} hostname={hostn}",
+                                    self.max_detail))
         if ev:
             self.events.append(ev)
         return ev
@@ -256,6 +304,8 @@ class Dissector:
         return {"frames_seen": self.frames_seen, "ip_frames": self.ip_frames,
                 "protected_skipped": self.protected_skipped,
                 "events": len(self.events), "flows": len(self.flows),
+                "redactions": self.redactions,
+                "redact_mode": self.redact,
                 "alerts": sum(1 for e in self.events if e.alert)}
 
 
@@ -312,10 +362,11 @@ def dhcp_hostname(bootp) -> str:
 
 # --------------------------------------------------------------- front-ends
 
-def analyze_pcap(path: str, max_frames: int = 0) -> Dissector:
+def analyze_pcap(path: str, max_frames: int = 0, redact: bool = True,
+                 anonymize_ips: bool = False) -> Dissector:
     """Dissect a capture file (pcap/pcapng, RadioTap or Ethernet linktype)."""
     from scapy.all import PcapReader
-    d = Dissector()
+    d = Dissector(redact=redact, anonymize_ips=anonymize_ips)
     n = 0
     with PcapReader(path) as rd:
         for pkt in rd:
@@ -330,14 +381,15 @@ def analyze_pcap(path: str, max_frames: int = 0) -> Dissector:
 
 
 def analyze_live(iface: str, duration: float = 30.0,
-                 on_event: Optional[callable] = None) -> Dissector:
+                 on_event: Optional[callable] = None, redact: bool = True,
+                 anonymize_ips: bool = False) -> Dissector:
     """Live pass-through dissection on an interface you own (root).
 
     Only frames visible in the air without decryption are parsed — i.e. your
     open network / management-plane metadata. Everything protected is skipped.
     """
     from scapy.all import sniff
-    d = Dissector()
+    d = Dissector(redact=redact, anonymize_ips=anonymize_ips)
 
     def cb(pkt):
         try:
@@ -357,6 +409,7 @@ def analyze_live(iface: str, duration: float = 30.0,
 
 
 def export(outdir: str, prefix: str, d: Dissector) -> List[str]:
+    from .privacy import secure_file
     os.makedirs(outdir, exist_ok=True)
     files = []
     for name, cols, rows in (
@@ -371,6 +424,7 @@ def export(outdir: str, prefix: str, d: Dissector) -> List[str]:
             w = csv.DictWriter(fh, fieldnames=cols)
             w.writeheader()
             w.writerows(rows)
+        secure_file(p)
         files.append(p)
         log.info("wrote %-42s (%d rows)", p, len(rows))
     return files

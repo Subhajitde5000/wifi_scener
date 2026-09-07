@@ -97,7 +97,15 @@ def rssi_bars(rssi: Optional[int]) -> str:
 
 @dataclass
 class Station:
-    """A client device (STA) seen associated with, or probing for, an AP."""
+    """A client device (STA) seen associated with, or probing for, an AP.
+
+    Trust model (see wifiscanner.trust): a station is *RF-observed* when
+    passive capture saw frames binding it to a BSSID, and *confirmed* only
+    when the router's own association table lists it. ``evidence_kinds``
+    records which frame-level proofs were seen; ``binding_confidence`` turns
+    them into a 0-100 score so callers can distinguish \"one stray frame\"
+    from \"assoc + EAPOL + bidirectional data\".
+    """
     mac: str
     bssid: Optional[str] = None          # AP it is associated with
     ssid: Optional[str] = None
@@ -116,9 +124,15 @@ class Station:
     ip_address: str = ""                 # only when actively scanning own LAN
     hostname: str = ""
     open_ports: list = field(default_factory=list)
+    # --- trust / evidence (weaknesses #1, #2, #9) ---
+    sources: set = field(default_factory=set)        # canonical trust.Source
+    evidence_kinds: set = field(default_factory=set)  # trust.BINDING_EVIDENCE
+    confirmed: bool = False              # in the router's assoc table?
+    _dirs: set = field(default_factory=set, repr=False)  # uplink/downlink seen
 
     def observe(self, rssi: Optional[int] = None, data: bool = False,
-                length: int = 0) -> None:
+                length: int = 0, source: str = "",
+                evidence: str = "", direction: str = "") -> None:
         self.last_seen = time.time()
         self.packets += 1
         self.bytes_seen += length
@@ -128,6 +142,85 @@ class Station:
             self.rssi = rssi
             self.rssi_min = rssi if self.rssi_min is None else min(self.rssi_min, rssi)
             self.rssi_max = rssi if self.rssi_max is None else max(self.rssi_max, rssi)
+        if source:
+            from .trust import normalize_source
+            self.sources.add(normalize_source(source))
+        if direction in ("up", "down"):
+            self._dirs.add(direction)
+            # A second direction upgrades unidir evidence to bidirectional.
+            if len(self._dirs) == 2:
+                self.evidence_kinds.discard("data-unidir")
+                self.evidence_kinds.discard("single-frame")
+                self.evidence_kinds.add("data-bidi")
+            elif not self.evidence_kinds:
+                self.evidence_kinds.add("data-unidir")
+        if evidence:
+            self.evidence_kinds.add(evidence)
+            if evidence in ("assoc-request", "eapol", "assoc-table",
+                            "data-bidi"):
+                self.evidence_kinds.discard("single-frame")
+        if not self.evidence_kinds and self.packets == 1:
+            self.evidence_kinds.add("single-frame")
+
+    @property
+    def binding_confidence(self) -> int:
+        """0-100: how strongly the AP binding is proven (trust model)."""
+        from .trust import binding_confidence
+        kinds = set(self.evidence_kinds)
+        if self.confirmed:
+            kinds.add("assoc-table")
+        if self.data_packets >= 2 and "up" in self._dirs and "down" in self._dirs:
+            kinds.add("data-bidi")
+        conf, _, _ = binding_confidence(kinds)
+        return conf
+
+    @property
+    def binding_kind(self) -> str:
+        from .trust import binding_confidence
+        kinds = set(self.evidence_kinds) | ({"assoc-table"} if self.confirmed else set())
+        _, best, _ = binding_confidence(kinds)
+        return best
+
+    @property
+    def binding_note(self) -> str:
+        from .trust import binding_confidence
+        kinds = set(self.evidence_kinds) | ({"assoc-table"} if self.confirmed else set())
+        _, _, note = binding_confidence(kinds)
+        return note
+
+    @property
+    def confidence_label(self) -> str:
+        from .trust import confidence_label
+        return confidence_label(self.binding_confidence)
+
+    @property
+    def source_label(self) -> str:
+        """Human 'source + confidence' one-liner for display/export."""
+        from .trust import confidence_label, source_label
+        if not self.sources:
+            return f"unrecorded ({self.binding_confidence}/100)"
+        best = sorted(self.sources)[0]
+        lbl = ", ".join(sorted(source_label(s) for s in self.sources))
+        return f"{lbl} — {confidence_label(self.binding_confidence)} ({self.binding_confidence}/100)"
+
+    @property
+    def identity_class(self) -> str:
+        """stable (globally-unique burned-in MAC) vs rotating (privacy MAC)."""
+        return "rotating-privacy-mac" if self.is_randomized else "stable-mac"
+
+    @property
+    def identity_note(self) -> str:
+        """Honesty guard for randomized MACs (weakness #2).
+
+        Distinct rotating addresses must NEVER be claimed to be distinct
+        devices — nor the same device. Both directions are unknowable from
+        passive observation alone.
+        """
+        if self.is_randomized:
+            return ("privacy MAC rotates: this address is one observation, not "
+                    "one device — distinct rotating addresses may be the same "
+                    "physical device, and one address may be reused by others")
+        return "burned-in MAC: stable identifier for this radio"
 
     @property
     def dwell_s(self) -> float:
@@ -141,6 +234,16 @@ class Station:
         d["signal_quality_pct"] = rssi_quality(self.rssi)
         d["first_seen"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.first_seen))
         d["last_seen"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.last_seen))
+        # Trust columns (weaknesses #1/#2/#9): source + confidence on every row.
+        d["sources"] = "|".join(sorted(self.sources)) if self.sources else ""
+        d["evidence"] = "|".join(sorted(self.evidence_kinds)) if self.evidence_kinds else ""
+        d["binding_confidence"] = self.binding_confidence
+        d["confidence"] = self.confidence_label
+        d["confirmed"] = int(self.confirmed)
+        d["identity_class"] = self.identity_class
+        d["identity_note"] = self.identity_note
+        d.pop("_dirs", None)
+        d.pop("evidence_kinds", None)
         return d
 
 
@@ -191,6 +294,83 @@ class AccessPoint:
     def active_client_count(self) -> int:
         """Clients that actually pushed data frames (real traffic)."""
         return sum(1 for s in self.stations.values() if s.data_packets > 0)
+
+    @property
+    def confirmed_client_count(self) -> int:
+        """Clients verified in the router's association table (ground truth).
+
+        Weakness #1: this is the ONLY count that may be stated as fact.
+        """
+        return sum(1 for s in self.stations.values() if s.confirmed)
+
+    @property
+    def rf_only_client_count(self) -> int:
+        """RF-observed clients NOT confirmed by the router (estimates)."""
+        return sum(1 for s in self.stations.values() if not s.confirmed)
+
+    @property
+    def census(self) -> dict:
+        """RF-observed vs router-confirmed client breakdown (weakness #1)."""
+        confirmed = [s for s in self.stations.values() if s.confirmed]
+        rf_only = [s for s in self.stations.values() if not s.confirmed]
+        high = sum(1 for s in rf_only if s.binding_confidence >= 85)
+        return {
+            "total_observed": len(self.stations),
+            "router_confirmed": len(confirmed),
+            "rf_only": len(rf_only),
+            "rf_high_confidence": high,
+            "active": self.active_client_count,
+        }
+
+    @property
+    def census_confidence(self) -> int:
+        """0-100 confidence in the client count for this AP.
+
+        Router confirmation dominates; otherwise the count is only as good
+        as its weakest binding, discounted for channel-hopping misses.
+        """
+        if not self.stations:
+            return 0
+        if self.confirmed_client_count == len(self.stations):
+            return 98
+        from .trust import combine_confidence
+        per_client = [s.binding_confidence for s in self.stations.values()]
+        # The *count* confidence: every observed binding must be right, and
+        # hopping means we may have missed clients entirely (-10, floor 5).
+        worst = min(per_client) if per_client else 0
+        fused = combine_confidence([worst, 70 if self.data_packets else 45])
+        return max(5, fused - (0 if self.confirmed_client_count else 10))
+
+    @property
+    def census_note(self) -> str:
+        from .trust import confidence_label
+        c = self.census
+        if c["router_confirmed"]:
+            return (f"{c['router_confirmed']} router-confirmed + "
+                    f"{c['rf_only']} RF-observed "
+                    f"({confidence_label(self.census_confidence)} "
+                    f"confidence {self.census_confidence}/100)")
+        if not self.stations:
+            return "no clients observed"
+        return (f"{c['total_observed']} RF-observed, 0 router-confirmed "
+                f"({confidence_label(self.census_confidence)} confidence "
+                f"{self.census_confidence}/100 — estimate, not a fact)")
+
+    @property
+    def ap_confidence(self) -> int:
+        from .trust import ap_confidence
+        conf, _ = ap_confidence(self.source, beacons=self.beacons,
+                                has_security=bool(self.security),
+                                has_channel=self.channel is not None)
+        return conf
+
+    @property
+    def ap_confidence_note(self) -> str:
+        from .trust import ap_confidence
+        _, note = ap_confidence(self.source, beacons=self.beacons,
+                                has_security=bool(self.security),
+                                has_channel=self.channel is not None)
+        return note
 
     @property
     def snr(self) -> Optional[int]:
@@ -279,12 +459,29 @@ class AccessPoint:
             self.stations[sta.mac] = sta
             return sta
         cur.last_seen = max(cur.last_seen, sta.last_seen)
+        cur.first_seen = min(cur.first_seen, sta.first_seen)
         cur.packets += sta.packets
         cur.data_packets += sta.data_packets
         cur.bytes_seen += sta.bytes_seen
         if sta.rssi is not None:
             cur.rssi = sta.rssi
         cur.probed_ssids |= sta.probed_ssids
+        # Trust fusion: union evidence/sources; router confirmation sticks.
+        cur.sources |= set(getattr(sta, "sources", set()))
+        cur.evidence_kinds |= set(getattr(sta, "evidence_kinds", set()))
+        cur._dirs |= set(getattr(sta, "_dirs", set()))
+        if sta.confirmed:
+            cur.confirmed = True
+            cur.evidence_kinds.add("assoc-table")
+            cur.evidence_kinds.discard("single-frame")
+        if len(cur._dirs) == 2:
+            cur.evidence_kinds.discard("data-unidir")
+            cur.evidence_kinds.discard("single-frame")
+            cur.evidence_kinds.add("data-bidi")
+        cur.ip_address = cur.ip_address or sta.ip_address
+        cur.hostname = cur.hostname or sta.hostname
+        cur.open_ports = cur.open_ports or sta.open_ports
+        cur.vendor = cur.vendor or sta.vendor
         return cur
 
     def to_row(self) -> dict:
@@ -323,6 +520,12 @@ class AccessPoint:
             "data_packets": self.data_packets,
             "connected_devices": self.client_count,
             "active_devices": self.active_client_count,
+            "confirmed_devices": self.confirmed_client_count,
+            "rf_only_devices": self.rf_only_client_count,
+            "census_confidence": self.census_confidence,
+            "census_note": self.census_note,
+            "ap_confidence": self.ap_confidence,
+            "ap_confidence_note": self.ap_confidence_note,
             "client_macs": "|".join(sorted(self.stations)),
             "first_seen": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.first_seen)),
             "last_seen": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.last_seen)),

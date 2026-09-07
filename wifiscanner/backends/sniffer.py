@@ -375,7 +375,8 @@ class MonitorSniffer:
                 sta = Station(mac=a2, vendor=oui_lookup(a2),
                               is_randomized=is_randomized(a2))
                 self.unassociated[a2] = sta
-            sta.observe(rssi, length=length)
+            sta.observe(rssi, length=length, source="monitor",
+                        evidence="probe-only")
             sta.channel = freq_to_channel(freq) if freq else sta.channel
             el = pkt.getlayer(Dot11Elt)
             if el is not None and el.ID == 0 and el.info:
@@ -395,7 +396,8 @@ class MonitorSniffer:
                 sta = ap.stations.get(client) or Station(
                     mac=client, vendor=oui_lookup(client),
                     is_randomized=is_randomized(client))
-                sta.observe(rssi, length=length)
+                sta.observe(rssi, length=length, source="monitor",
+                            evidence="assoc-request")
                 ap.add_station(sta)
                 self.unassociated.pop(client, None)
             return
@@ -410,7 +412,8 @@ class MonitorSniffer:
             return
 
         # ---- EAPOL: a 4-way handshake means a device just joined
-        if pkt.haslayer(EAPOL) or self._raw_eapol(d):
+        eapol_here = pkt.haslayer(EAPOL) or self._raw_eapol(d)
+        if eapol_here:
             bssid = a3 or a1 or a2
             if bssid and relevant(bssid):
                 self.handshakes[bssid] = self.handshakes.get(bssid, 0) + 1
@@ -419,10 +422,13 @@ class MonitorSniffer:
         if ftype in (1, 2):
             to_ds, from_ds = int(d.FCfield) & 0x1, (int(d.FCfield) >> 1) & 0x1
             bssid = client = None
+            direction = ""
             if to_ds and not from_ds:            # STA -> AP
                 bssid, client = a1, a2
+                direction = "up"
             elif from_ds and not to_ds:          # AP -> STA
                 bssid, client = a2, a1
+                direction = "down"
             elif not to_ds and not from_ds:      # ad-hoc / control
                 bssid, client = a3, a2
             else:                                # WDS/mesh: 4-address frame
@@ -446,7 +452,11 @@ class MonitorSniffer:
                               is_randomized=is_randomized(client))
                 ap.stations[client] = sta
                 self.unassociated.pop(client, None)
-            sta.observe(rssi, data=(ftype == 2), length=length)
+            # Trust evidence (weaknesses #1/#9): direction proves data-bidi
+            # over time; EAPOL on this BSS corroborates the binding.
+            sta.observe(rssi, data=(ftype == 2), length=length,
+                        source="monitor", direction=direction,
+                        evidence="eapol" if eapol_here else "")
             if freq:
                 sta.channel = freq_to_channel(freq)
             if self.on_update:
@@ -456,15 +466,22 @@ class MonitorSniffer:
 
     def run(self, duration: float = 30.0, pcap_out: str = "",
             ring_segments: int = 0, rotate_mb: float = 0.0,
-            on_packet: Optional[Callable] = None) -> None:
+            on_packet: Optional[Callable] = None,
+            snaplen: int = 0, secure_storage: bool = True) -> None:
         """Sniff for `duration` seconds (blocking).
 
         pcap_out:   write a capture file (streamed, never buffered in RAM).
         rotate_mb:  start a new file after N MB (forensic segmentation).
         ring_segments: keep only the last N files, overwriting the oldest —
                     a bounded, disk-safe ring buffer for 24/7 recording.
+        snaplen:    truncate every captured frame to N bytes (weakness #5).
+                    snaplen<=128 keeps 802.11 headers (client counting, IDS)
+                    while discarding payloads — a privacy-preserving capture.
+                    0 = full frames.
+        secure_storage: chmod capture files 0600 (owner-only, weakness #5).
         """
         from scapy.all import sniff
+        from ..privacy import secure_file
         self.started_at = time.time()
         if len(self.channels) > 1:
             self._hopper = threading.Thread(target=self._hop, daemon=True)
@@ -474,14 +491,29 @@ class MonitorSniffer:
         base, ext = (os.path.splitext(pcap_out) if pcap_out else ("", ""))
         ext = ext or ".pcap"
         limit = int(rotate_mb * 1_000_000) if rotate_mb else 0
+        wrote_paths: List[str] = []
 
         def seg_path(i: int) -> str:
             return pcap_out if i == 0 else f"{base}-{i % max(ring_segments, 1):03d}{ext}" \
                 if ring_segments else f"{base}-{i:03d}{ext}"
 
-        if pcap_out:
+        def open_writer(i: int):
             from scapy.all import PcapWriter
-            writer = PcapWriter(seg_path(0), sync=True)
+            path = seg_path(i)
+            kwargs = {"sync": True}
+            if snaplen and snaplen > 0:
+                kwargs["snaplen"] = snaplen
+            w = PcapWriter(path, **kwargs)
+            wrote_paths.append(path)
+            if secure_storage:
+                secure_file(path)
+            return w
+
+        if pcap_out:
+            writer = open_writer(0)
+            if snaplen:
+                log.info("privacy-preserving capture: frames truncated to %d "
+                         "bytes (headers for counting/IDS, no payloads)", snaplen)
 
         def cb(pkt):
             nonlocal seg, seg_bytes, writer
@@ -500,7 +532,7 @@ class MonitorSniffer:
                 if limit and seg_bytes >= limit:
                     writer.close()
                     seg += 1
-                    writer = PcapWriter(seg_path(seg), sync=True)  # ring: overwrites oldest
+                    writer = open_writer(seg)  # ring: overwrites oldest
                     log.info("rotated capture -> %s", seg_path(seg))
                     seg_bytes = 0
 

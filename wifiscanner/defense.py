@@ -38,12 +38,41 @@ class Alert:
     src: str
     dst: str
     detail: str
+    confidence: int = 0            # 0-100 (weaknesses #7/#9)
+    evidence: str = ""             # "|"-joined corroborating signals
+    status: str = "unconfirmed"    # unconfirmed | corroborated | confirmed
 
     def to_row(self) -> dict:
+        from .trust import confidence_label
         return {"time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ts)),
                 "severity": self.severity, "kind": self.kind, "bssid": self.bssid,
                 "ssid": self.ssid, "src": self.src, "dst": self.dst,
+                "confidence": self.confidence,
+                "confidence_label": confidence_label(self.confidence),
+                "status": self.status, "evidence": self.evidence,
                 "detail": self.detail}
+
+
+# What would turn each single-indicator alert into a confirmed incident.
+CORROBORATION = {
+    "deauth-flood": ("to confirm: look for forced-reauth / handshake-harvest "
+                     "alerts on the same BSS within seconds; lone floods are "
+                     "often roaming, interference or a rebooting AP"),
+    "forced-reauth": ("corroborated by the deauth->assoc timing chain; confirm "
+                      "with client logs or repeated occurrences"),
+    "handshake-harvest-signature": ("full deauth->assoc->EAPOL chain observed; "
+                                    "treat as a real attack in progress"),
+    "eapol-storm": ("to confirm: pair with deauth-flood on the same BSS; lone "
+                    "storms can be mass roaming (e.g. AP reboot)"),
+    "beacon-mutation": ("to confirm: verify no admin reconfig happened and the "
+                        "new fingerprint persists across beacons; single "
+                        "sightings are often channel-switch announcements"),
+    "unknown-bss": ("to confirm: physically verify the new AP; new legitimate "
+                    "neighbours and extenders trigger this routinely"),
+}
+
+# Sensitivity scales the flood threshold: low = fewer, surer alerts.
+SENSITIVITY_MULT = {"low": 2.0, "medium": 1.0, "high": 0.6}
 
 
 class Watchdog:
@@ -51,10 +80,12 @@ class Watchdog:
 
     def __init__(self, window_s: float = 10.0, flood_frames: int = 5,
                  cooldown_s: float = 30.0, known_bssids: Set[str] = frozenset(),
-                 ap_of_client: Optional[Dict[str, str]] = None):
+                 ap_of_client: Optional[Dict[str, str]] = None,
+                 sensitivity: str = "medium"):
         self.window = window_s
         self.flood_n = flood_frames
         self.cooldown = cooldown_s
+        self.sensitivity = sensitivity if sensitivity in SENSITIVITY_MULT else "medium"
         self.known: Set[str] = {k.upper() for k in known_bssids}
         self.ap_of_client = ap_of_client or {}
         self.deauth_by_ap: Dict[str, deque] = defaultdict(deque)
@@ -65,20 +96,61 @@ class Watchdog:
         self.ap_ssid: Dict[str, str] = {}
         self.alerts: List[Alert] = []
         self._last_fired: Dict[Tuple, float] = {}
+        self._mutation_seen: Dict[Tuple[str, Tuple], int] = {}  # (ap,sig) -> count
         self.frames = 0
         self.started = time.time()
+
+    @property
+    def effective_flood_n(self) -> int:
+        """Flood threshold after sensitivity scaling (weakness #7)."""
+        return max(2, int(round(self.flood_n * SENSITIVITY_MULT[self.sensitivity])))
+
+    def _adaptive_margin(self) -> int:
+        """Raise the bar when deauths are everywhere (roam storms, radar...).
+
+        If >= 3 distinct BSSIDs each show >= 2 deauths in-window, the air is
+        noisy for everyone — require +2 frames before calling any single AP a
+        flood. Single-AP attacks are unaffected.
+        """
+        now = time.time()
+        noisy = 0
+        for q in self.deauth_by_ap.values():
+            recent = sum(1 for t in q if now - t <= self.window)
+            if recent >= 2:
+                noisy += 1
+        return 2 if noisy >= 3 else 0
 
     # ---------------------------------------------------------- firing
 
     def _fire(self, kind: str, severity: str, bssid: str, detail: str,
-               src: str = "", dst: str = "", key_extra: str = "") -> None:
+               src: str = "", dst: str = "", key_extra: str = "",
+               confidence: int = 50, evidence: str = "",
+               status: str = "unconfirmed") -> Optional[Alert]:
         key = (kind, bssid, key_extra)
         now = time.time()
         if now - self._last_fired.get(key, 0.0) < self.cooldown:
-            return
+            return None
         self._last_fired[key] = now
-        self.alerts.append(Alert(now, severity, kind, bssid,
-                                 self.ap_ssid.get(bssid, ""), src, dst, detail))
+        hint = CORROBORATION.get(kind, "")
+        full = f"{detail} [{hint}]" if hint else detail
+        alert = Alert(now, severity, kind, bssid,
+                      self.ap_ssid.get(bssid, ""), src, dst, full,
+                      confidence, evidence, status)
+        self.alerts.append(alert)
+        return alert
+
+    def _corroborate(self, kind: str, bssid: str, extra_evidence: str,
+                     confidence: int, key_extra: str = "") -> None:
+        """Upgrade an earlier unconfirmed alert when new proof arrives."""
+        for a in self.alerts:
+            if a.kind == kind and a.bssid == bssid and a.status == "unconfirmed":
+                if key_extra and a.src != key_extra and a.dst != key_extra:
+                    continue
+                a.confidence = max(a.confidence, confidence)
+                a.status = "corroborated"
+                bits = [b for b in (a.evidence + "|" + extra_evidence).split("|") if b]
+                a.evidence = "|".join(dict.fromkeys(bits))
+                return
 
     # ---------------------------------------------------------- parsing
 
@@ -99,18 +171,23 @@ class Watchdog:
         if t == 0 and st in (12, 11):                     # deauth / disassoc
             self.deauth_by_ap[ap].append(now)
             self._trim(self.deauth_by_ap[ap])
-            if len(self.deauth_by_ap[ap]) >= self.flood_n:
+            threshold = self.effective_flood_n + self._adaptive_margin()
+            if len(self.deauth_by_ap[ap]) >= threshold:
                 baselined = not self.known or ap in self.known
                 note = ("on YOUR baseline network" if ap in self.known
                         else "on a BSS outside your baseline") if self.known \
                         else ""
+                conf = 70 if ap in self.known else (55 if baselined else 35)
                 self._fire("deauth-flood",
                            "high" if baselined else "info", ap,
                            f"{len(self.deauth_by_ap[ap])} deauth/disassoc in "
                            f"{self.window:.0f}s {note} - kick/redirect or "
                            f"handshake-harvest bait; PMF-required clients "
                            f"ignore forged management frames",
-                           src=d.addr1 or "")
+                           src=d.addr1 or "",
+                           confidence=conf,
+                           evidence=f"{len(self.deauth_by_ap[ap])}-in-"
+                                    f"{self.window:.0f}s|threshold-{threshold}")
             # remember for the forced-reauth chain (attacker kicks both ways)
             for other in (d.addr1, d.addr2):
                 if other:
@@ -122,18 +199,29 @@ class Watchdog:
                 self._fire("forced-reauth", "critical", ap,
                            "reassociation within seconds of a deauth - classic "
                            "deauth->reauth->harvest chain; verify PMF is "
-                           "required on this BSS", src=sta, key_extra=sta)
+                           "required on this BSS", src=sta, key_extra=sta,
+                           confidence=80, status="corroborated",
+                           evidence="deauth-then-assoc-timing")
+                # The reassoc corroborates the earlier flood alert too.
+                self._corroborate("deauth-flood", ap,
+                                  "victim-reassociated-after-kick", 85)
         elif t == 0 and st == 8:                          # beacon
             self._beacon(d, pkt)
         elif t == 2:                                      # data / qos
             if self._is_eapol(pkt):
                 self.eapol_by_ap[ap].append(now)
                 self._trim(self.eapol_by_ap[ap])  # same window
-                if len(self.eapol_by_ap[ap]) >= self.flood_n + 1:
+                if len(self.eapol_by_ap[ap]) >= self.effective_flood_n + 1:
+                    paired = any(self.deauth_by_ap.get(ap, []))
                     self._fire("eapol-storm", "high", ap,
                                f"{len(self.eapol_by_ap[ap])} EAPOL frames in "
                                f"{self.window * 3:.0f}s - renegotiation storm, "
-                               f"often paired with client kicking")
+                               f"often paired with client kicking",
+                               confidence=75 if paired else 55,
+                               status="corroborated" if paired else "unconfirmed",
+                               evidence=(f"{len(self.eapol_by_ap[ap])}-eapol|"
+                                         f"paired-with-deauth" if paired else
+                                         f"{len(self.eapol_by_ap[ap])}-eapol"))
                 ta = self.last_assoc.get((ap, sta), 0.0)
                 td = self.last_deauth.get((ap, sta), 0.0)
                 if now - ta <= self.window and ta - td <= self.window:
@@ -142,7 +230,14 @@ class Watchdog:
                                f"{self.window:.0f}s for client {sta}: someone "
                                "is attempting 4-way handshake harvesting; "
                                "rotate no secrets until PMF is enforced",
-                               src=sta, key_extra=sta)
+                               src=sta, key_extra=sta,
+                               confidence=95, status="confirmed",
+                               evidence="deauth-then-assoc-then-eapol-chain")
+                    self._corroborate("deauth-flood", ap,
+                                      "full-harvest-chain-observed", 95)
+                    self._corroborate("forced-reauth", ap,
+                                      "eapol-completed-the-chain", 95,
+                                      key_extra=sta)
 
     def _trim(self, q: deque) -> None:
         cutoff = time.time() - self.window
@@ -193,15 +288,35 @@ class Watchdog:
         sig = (chan, tuple(sorted(secs)))
         old = self.ap_fingerprint.get(ap)
         if old is not None and old != sig:
-            self._fire("beacon-mutation", "medium", ap,
-                       f"beacon changed in-flight: channel/security IEs went "
-                       f"{old} -> {sig}; either you reconfigured it or someone "
-                       f"is impersonating the SSID", key_extra="beacon")
-        self.ap_fingerprint[ap] = sig
+            # Persistence check (weakness #7): a single changed beacon is a
+            # weak signal (channel-switch announcements, reconfigs). Fire
+            # immediately but at LOW confidence; the baseline only moves to
+            # the new fingerprint once it persists across >= 3 beacons, at
+            # which point the earlier alert is upgraded to corroborated.
+            n = self._mutation_seen.get((ap, sig), 0) + 1
+            self._mutation_seen[(ap, sig)] = n
+            if n >= 3:
+                self._corroborate("beacon-mutation", ap,
+                                  f"new-fingerprint-persisted-{n}-beacons", 78)
+                self.ap_fingerprint[ap] = sig
+                self._mutation_seen.pop((ap, sig), None)
+            else:
+                self._fire("beacon-mutation", "medium", ap,
+                           f"beacon changed in-flight: channel/security IEs went "
+                           f"{old} -> {sig}; either you reconfigured it or someone "
+                           f"is impersonating the SSID",
+                           key_extra="beacon", confidence=45,
+                           evidence="single-sighting-unconfirmed")
+        else:
+            # Stable beacon: clear any pending mutation counters for this AP.
+            for k in [k for k in self._mutation_seen if k[0] == ap]:
+                self._mutation_seen.pop(k, None)
+            self.ap_fingerprint[ap] = sig
         if self.known and ap not in self.known:
             self._fire("unknown-bss", "medium", ap,
                        f"first sighting of BSSID advertising {ssid or '<hidden>'!r} "
-                       f"- not in your warden baseline", key_extra="warden")
+                       f"- not in your warden baseline", key_extra="warden",
+                       confidence=50, evidence="not-in-warden-baseline")
 
     # ------------------------------------------------------------ output
 

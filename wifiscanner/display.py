@@ -50,14 +50,16 @@ def print_networks(engine: Engine, sort: str = "rssi", limit: int = 0) -> None:
         aps = aps[:limit]
     if not _RICH:
         print(f"\n{'SSID':<26}{'BSSID':<19}{'CH':>4}{'RSSI':>6}{'Q':>5}  "
-              f"{'SEC':<14}{'GR':<3}{'DEV':>4}  VENDOR")
+              f"{'SEC':<14}{'GR':<3}{'DEV':>7}  VENDOR")
         print("-" * 110)
         for a in aps:
+            dev = (f"{a.confirmed_client_count}c+{a.rf_only_client_count}r"
+                   if a.confirmed_client_count else f"{a.client_count} RF")
             print(f"{(a.ssid or '<hidden>')[:25]:<26}{a.bssid:<19}"
                   f"{a.channel or '-':>4}{a.rssi if a.rssi is not None else '-':>6}"
                   f"{rssi_quality(a.rssi) or 0:>4}%  {a.encryption[:13]:<14}"
-                  f"{a.security_grade:<3}{a.client_count:>4}  {a.vendor[:22]}")
-        print(f"\n{len(aps)} networks")
+                  f"{a.security_grade:<3}{dev:>7}  {a.vendor[:22]}")
+        print(f"\n{len(aps)} networks  (DEV: Nc router-confirmed + Mr RF-observed)")
         return
 
     t = Table(title=f"Access Points ({len(aps)})", box=box.ROUNDED,
@@ -67,18 +69,31 @@ def print_networks(engine: Engine, sort: str = "rssi", limit: int = 0) -> None:
                     ("Band", {}), ("Ch", {"justify": "right"}),
                     ("Signal", {}), ("Dist", {"justify": "right"}),
                     ("Security", {"max_width": 18}), ("Gr", {"justify": "center"}),
-                    ("Dev", {"justify": "right"}), ("Risks", {"max_width": 26})):
+                    ("Clients", {"justify": "right"}), ("Conf", {}),
+                    ("Risks", {"max_width": 26})):
         t.add_column(col, **kw)
     for a in aps:
         sig = (f"[{_c(a.rssi)}]{rssi_bars(a.rssi)} "
                f"{a.rssi if a.rssi is not None else '--'}dBm[/]")
-        dev = f"[bold]{a.client_count}[/]" if a.client_count else "[dim]0[/]"
+        if a.confirmed_client_count:
+            dev = (f"[bold green]{a.confirmed_client_count}✓[/]+"
+                   f"[yellow]{a.rf_only_client_count}~[/]")
+        elif a.client_count:
+            dev = f"[yellow]{a.client_count}~[/]"
+        else:
+            dev = "[dim]0[/]"
+        cc = a.census_confidence
+        conf = (f"[green]{cc}[/]" if cc >= 85 else
+                (f"[yellow]{cc}[/]" if cc >= 60 else f"[red]{cc}[/]"))
         d = f"{a.distance_m:.0f}m" if a.distance_m else "-"
         t.add_row(a.ssid or "[dim italic]<hidden>[/]", a.bssid,
                   a.vendor or "[dim]?[/]", a.band, str(a.channel or "-"), sig, d,
                   a.encryption, f"[{_gc(a.security_grade)}]{a.security_grade}[/]",
-                  dev, "[yellow]" + ", ".join(r.split(":")[0] for r in a.risks[:3]) + "[/]")
+                  dev, conf,
+                  "[yellow]" + ", ".join(r.split(":")[0] for r in a.risks[:3]) + "[/]")
     console.print(t)
+    console.print("[dim]Clients: N✓ router-confirmed + M~ RF-observed estimate; "
+                  "Conf = census confidence 0-100[/]")
 
 
 def print_devices(engine: Engine, limit: int = 0) -> None:
@@ -96,29 +111,39 @@ def print_devices(engine: Engine, limit: int = 0) -> None:
     if limit:
         stations = stations[:limit]
     if not _RICH:
-        print(f"\n{'MAC':<19}{'VENDOR':<20}{'NETWORK':<22}{'RSSI':>6}"
-              f"{'PKTS':>7}  STATE")
+        print(f"\n{'MAC':<19}{'VENDOR':<16}{'NETWORK':<20}{'RSSI':>6}"
+              f"{'PKTS':>6}  {'CONF':>4}  STATE")
         for ap, s, st in stations:
-            print(f"{s.mac:<19}{(s.vendor or '?')[:19]:<20}"
-                  f"{(ap.ssid if ap else '-')[:21]:<22}"
-                  f"{s.rssi if s.rssi is not None else '-':>6}{s.packets:>7}  {st}")
+            mark = "✓" if s.confirmed else "~"
+            print(f"{s.mac:<19}{(s.vendor or '?')[:15]:<16}"
+                  f"{(ap.ssid if ap else '-')[:19]:<20}"
+                  f"{s.rssi if s.rssi is not None else '-':>6}{s.packets:>6}  "
+                  f"{mark}{s.binding_confidence:>3}  {st}")
+        print("  (CONF: ✓nn router-confirmed / ~nn RF-observed confidence 0-100)")
         return
     t = Table(title=f"Client Devices ({len(stations)})", box=box.ROUNDED,
               header_style="bold magenta", expand=True)
     for col in ("MAC", "Vendor", "Rnd", "Network", "IP / Host", "Signal",
-                "Pkts", "Data", "Dwell", "State", "Probed SSIDs"):
+                "Pkts", "Data", "Dwell", "Conf", "State", "Probed SSIDs"):
         t.add_column(col, max_width=26 if col == "Probed SSIDs" else None)
     for ap, s, st in stations:
         ipinfo = s.ip_address + (f" {s.hostname}" if s.hostname else "")
+        bc = s.binding_confidence
+        conf = ("[green]✓%d[/]" % bc if s.confirmed else
+                ("[yellow]~%d[/]" % bc if bc >= 60 else "[red]~%d[/]" % bc))
         t.add_row(s.mac, (s.vendor or "?")[:18],
                   "[yellow]Y[/]" if s.is_randomized else "",
                   (ap.ssid or ap.bssid) if ap else "[dim]-[/]",
                   ipinfo or "[dim]-[/]",
                   f"[{_c(s.rssi)}]{s.rssi if s.rssi is not None else '--'}dBm[/]",
                   str(s.packets), str(s.data_packets), f"{s.dwell_s:.0f}s",
+                  conf,
                   "[green]assoc[/]" if st == "associated" else "[dim]probe[/]",
                   ", ".join(sorted(s.probed_ssids))[:26])
     console.print(t)
+    console.print("[dim]Conf: ✓nn router-confirmed / ~nn RF-observed (binding "
+                  "confidence 0-100); Rnd=Y means the MAC rotates — never treat "
+                  "distinct rotating addresses as distinct devices[/]")
 
 
 def print_detail(ap: AccessPoint) -> None:
@@ -151,6 +176,8 @@ def print_detail(ap: AccessPoint) -> None:
         ("EAPOL handshakes", ap.raw.get("eapol_frames", 0)),
         ("Deauth frames", ap.raw.get("deauths", 0)),
         ("Connected devices", f"{ap.client_count} ({ap.active_client_count} active)"),
+        ("Client census", ap.census_note),
+        ("AP confidence", f"{ap.ap_confidence}/100 — {ap.ap_confidence_note}"),
         ("Data source", ap.source),
     ]
     body = "\n".join(f"[cyan]{k:<22}[/] {v}" for k, v in lines) if _RICH \
@@ -193,13 +220,17 @@ def print_summary(engine: Engine) -> None:
         ("Unique SSIDs", s["unique_ssids"]),
         ("Hidden SSIDs", s["hidden_ssids"]),
         ("Client devices", f"{s['connected_devices']} ({s['active_devices']} active)"),
+        ("  router-confirmed", s.get("connected_devices_confirmed", 0)),
+        ("  RF-observed only", s.get("connected_devices_rf_only", 0)),
+        ("Est. physical devices", s.get("estimated_devices_range", "?")),
         ("Unassociated/probing", s["unassociated_devices"]),
         ("Randomized MACs", s["randomized_macs"]),
         ("Open networks", s["open_networks"]),
         ("WEP networks", s["wep_networks"]),
         ("WPA3 networks", s["wpa3_networks"]),
         ("WPS enabled", s["wps_enabled"]),
-        ("Rogue/evil-twin alerts", s["rogue_alerts"]),
+        ("Rogue likely-rogue", s["rogue_alerts"]),
+        ("Rogue unconfirmed", s.get("rogue_unconfirmed", 0)),
         ("Signal range", f"{s['strongest_rssi_dbm']} .. {s['weakest_rssi_dbm']} dBm"),
         ("Bands", ", ".join(f"{k}:{v}" for k, v in s["bands"].items())),
         ("Recommended channels", ", ".join(
@@ -290,20 +321,27 @@ def print_congestion(engine: Engine) -> None:
         console.print(t)
 
 
-def print_rogues(engine: Engine) -> None:
-    alerts = engine.rogue_candidates()
+def print_rogues(engine: Engine, known_bssids=None) -> None:
+    alerts = engine.rogue_candidates(known_bssids)
     if not alerts:
         return
     if not _RICH:
-        print("\n!! Rogue / evil-twin alerts:")
+        print("\n!! Rogue / evil-twin assessment (multi-indicator scoring):")
         for a in alerts:
-            print(f"  [{a['severity']}] {a['ssid']}: {a['reasons']}")
+            print(f"  [{a['severity']}] {a['ssid']} ({a['verdict']}, "
+                  f"score {a['score']}, {a['indicator_count']} indicators): "
+                  f"{a['reasons']}")
+        print("  (unconfirmed = single indicator only — NOT declared rogue)")
         return
-    t = Table(title="Rogue / Evil-Twin Alerts", box=box.ROUNDED,
+    t = Table(title="Rogue / Evil-Twin Assessment", box=box.ROUNDED,
               header_style="bold red")
-    for c in ("SSID", "BSSIDs", "Severity", "Reasons"):
+    for c in ("SSID", "BSSIDs", "Severity", "Verdict", "Score", "Reasons"):
         t.add_column(c)
     for a in alerts:
-        t.add_row(a["ssid"], str(a["bssid_count"]),
-                  f"[red]{a['severity']}[/]", a["reasons"])
+        sev = (f"[red]{a['severity']}[/]" if a["verdict"] == "likely-rogue"
+               else f"[yellow]{a['severity']}[/]")
+        t.add_row(a["ssid"], str(a["bssid_count"]), sev,
+                  a["verdict"], str(a["score"]), a["reasons"])
     console.print(t)
+    console.print("[dim]Verdict 'likely-rogue' requires >= 2 independent "
+                  "indicators; anything else is unconfirmed, not rogue[/]")

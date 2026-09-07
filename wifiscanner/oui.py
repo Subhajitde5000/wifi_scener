@@ -97,6 +97,29 @@ def is_multicast(mac: str) -> bool:
         return False
 
 
+def classify_mac(mac: str) -> tuple[str, str]:
+    """Classify an observed MAC for identity honesty (weakness #2).
+
+    Returns (identity_class, note):
+
+    * ``stable-mac`` — burned-in OUI address; a stable radio identifier.
+    * ``rotating-privacy-mac`` — locally-administered address that the OS
+      rotates. Distinct rotating addresses must never be claimed to be
+      distinct devices — nor the same device. Both are unknowable passively.
+    * ``multicast`` — group/broadcast address; never a device identity.
+    """
+    mac = normalize(mac)
+    if is_multicast(mac):
+        return ("multicast",
+                "group/broadcast address — never count as a device")
+    if is_randomized(mac):
+        return ("rotating-privacy-mac",
+                "privacy address rotates: one observation, not one device; "
+                "do not equate distinct rotating addresses with distinct "
+                "devices (or with each other)")
+    return ("stable-mac", "burned-in address: stable identifier for this radio")
+
+
 @lru_cache(maxsize=1)
 def _load_db() -> dict:
     db = dict(BUILTIN)

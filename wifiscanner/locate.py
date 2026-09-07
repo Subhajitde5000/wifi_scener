@@ -133,6 +133,14 @@ class Measure:
 
 @dataclass
 class Fix:
+    """One position estimate.
+
+    Weakness #4 (noisy location): a fix is ALWAYS reported with its error
+    radius (``uncertainty_m``), a ``confidence`` bucket, and the ``zone`` as
+    the primary answer. When confidence is low, callers should present the
+    zone — not the coordinates — as the result (``precise_ok`` is False and
+    ``display`` renders the zone-level answer).
+    """
     ts: float
     mac: str
     x: Optional[float]
@@ -141,6 +149,73 @@ class Fix:
     method: str
     sensors: str
     zone: str = "unknown"
+    confidence: str = ""          # high / medium / low (filled by Tracker)
+    zone_confidence: str = ""     # confidence in the ZONE answer specifically
+    sensor_count: int = 0
+    rssi_spread_db: Optional[float] = None
+
+    @property
+    def error_radius_m(self) -> Optional[float]:
+        """Explicit error radius: 'the device is within ±X m of (x, y)'."""
+        return self.uncertainty_m
+
+    @property
+    def precise_ok(self) -> bool:
+        """Whether coordinates may be presented as the answer."""
+        return self.confidence in ("high", "medium") and self.x is not None
+
+    @property
+    def display(self) -> str:
+        """Zone-primary human rendering (weakness #4)."""
+        if not self.precise_ok:
+            unc = f"±{self.uncertainty_m:.0f}m" if self.uncertainty_m else "unknown error"
+            return (f"zone '{self.zone}' only ({unc}, {self.confidence or 'low'} "
+                    f"confidence — coordinates withheld as unreliable)")
+        return (f"({self.x:.1f}, {self.y:.1f}) ±{self.uncertainty_m:.0f}m, "
+                f"zone '{self.zone}' ({self.confidence} confidence)")
+
+    def to_row(self) -> dict:
+        return {"ts": self.ts, "mac": self.mac, "x": self.x, "y": self.y,
+                "unc_m": self.uncertainty_m, "error_radius_m": self.error_radius_m,
+                "zone": self.zone, "zone_confidence": self.zone_confidence,
+                "method": self.method, "confidence": self.confidence,
+                "sensors": self.sensors, "sensor_count": self.sensor_count,
+                "display": self.display}
+
+
+def fix_confidence(method: str, uncertainty: Optional[float],
+                   sensor_count: int, grid_diag_m: float,
+                   rssi_spread_db: Optional[float] = None) -> tuple[str, str]:
+    """Derive (fix confidence, zone confidence) for a location fix.
+
+    Rules (weakness #4):
+    * nearest-sensor / guarded / single-sensor fixes are NEVER more than
+      low confidence for coordinates — they are zone hints.
+    * trilateration with >= 3 sensors and small residual error is medium,
+      high only when the error is < 15% of the grid diagonal.
+    * bilateration is ambiguous by construction -> low for coordinates,
+      medium for zone.
+    * the ZONE answer is one grade more confident than coordinates, because
+      room-level is what RSSI positioning can actually deliver.
+    """
+    order = ["low", "medium", "high"]
+    if method.startswith("nearest-sensor"):
+        coord = "low"
+    elif method.startswith("bilateration"):
+        coord = "low"
+    elif method.startswith("trilateration"):
+        if sensor_count >= 4 and uncertainty and uncertainty < 0.15 * grid_diag_m:
+            coord = "high"
+        elif sensor_count >= 3 and uncertainty and uncertainty < 0.5 * grid_diag_m:
+            coord = "medium"
+        else:
+            coord = "low"
+    else:
+        coord = "low"
+    if rssi_spread_db is not None and rssi_spread_db > 25 and coord == "high":
+        coord = "medium"  # wildly disagreeing sensors -> demote
+    zone = order[min(2, order.index(coord) + 1)]
+    return coord, zone
 
 
 def multilateration(measures: List[Measure],
@@ -246,6 +321,20 @@ class Tracker:
             out.append(Measure(sensor=s, rssi=r["rssi"], freq=freq))
         return out
 
+    def grid_diagonal(self) -> float:
+        xs = [s.x for s in self.sensors]
+        ys = [s.y for s in self.sensors]
+        return max(math.hypot(max(xs) - min(xs), max(ys) - min(ys)), 10.0)
+
+    def _score(self, method: str, unc: Optional[float],
+               ms: List[Measure]) -> tuple:
+        """Attach confidence + error-radius metadata to a raw fix."""
+        rssis = [m.rssi for m in ms if m.rssi is not None]
+        spread = (max(rssis) - min(rssis)) if len(rssis) >= 2 else None
+        coord, zone_c = fix_confidence(method, unc, len(ms),
+                                       self.grid_diagonal(), spread)
+        return coord, zone_c, len(ms), spread
+
     def fixes(self, observations: List[dict]) -> List[Fix]:
         """observations: rows with ts, sensor, mac, rssi, freq (sorted by ts)."""
         by_mac: Dict[str, List[dict]] = {}
@@ -268,15 +357,22 @@ class Tracker:
                 names = "|".join(sorted({m.sensor.name for m in ms}))
                 if res:
                     x, y, unc, method = res
+                    coord, zone_c, nsen, spread = self._score(method, unc, ms)
                     fixes.append(Fix(ts, mac, x, y, unc, method,
                                      f"{len(ms)}sensors:{names}",
-                                     zone_at(x, y, self.zones)))
+                                     zone_at(x, y, self.zones),
+                                     confidence=coord, zone_confidence=zone_c,
+                                     sensor_count=nsen, rssi_spread_db=spread))
                 else:                        # single sensor: coarse zone hint
                     m = max(ms, key=lambda mm: mm.rssi or -999)
+                    coord, zone_c, nsen, spread = self._score(
+                        "nearest-sensor", None, ms)
                     fixes.append(Fix(ts, mac, m.sensor.x, m.sensor.y, None,
                                      "nearest-sensor",
                                      f"1sensor:{m.sensor.name}",
-                                     zone_at(m.sensor.x, m.sensor.y, self.zones)))
+                                     zone_at(m.sensor.x, m.sensor.y, self.zones),
+                                     confidence=coord, zone_confidence=zone_c,
+                                     sensor_count=nsen, rssi_spread_db=spread))
 
             for r in rows:
                 if t0 is None or r["ts"] - t0 <= self.window_s:
