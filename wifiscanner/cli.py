@@ -333,20 +333,31 @@ def build_parser() -> argparse.ArgumentParser:
     inj.add_argument("-i", "--interface", default="", help="wireless interface")
     inj.add_argument("--mode", default="probe",
                      choices=["probe", "canary", "pmf-test", "deauth",
-                              "ids-selftest"],
+                              "evil-twin", "ids-selftest"],
                      help="probe = active survey; canary = IDS/sensor coverage "
                           "marker; pmf-test = small burst to verify YOUR AP "
                           "enforces PMF; deauth = explicit bounded unicast "
                           "deauth/disassoc TEST of YOUR own client (pen-test); "
+                          "evil-twin = bounded BEACON-ONLY drill that "
+                          "advertises your own SSID from a spoofed BSSID to "
+                          "test rogue-AP detection (no client/data path); "
                           "ids-selftest = offline, zero-RF IDS signature check")
     inj.add_argument("-c", "--channels", default="",
-                     help="comma list, e.g. 1,6,11 (kick modes: the AP channel)")
+                     help="comma list, e.g. 1,6,11 (kick/twin modes: channel)")
     inj.add_argument("--ssid", default="",
                      help="probe mode: directed probe for this SSID (default: "
-                          "wildcard broadcast probe, like normal client scans)")
+                          "wildcard broadcast probe, like normal client scans); "
+                          "evil-twin: the network name YOU own that the beacon "
+                          "drill advertises (required for that mode)")
+    inj.add_argument("--security", default="open", choices=["open", "wpa2"],
+                     help="evil-twin drill: security the cloned beacon "
+                          "advertises (open = the classic open-clone; wpa2 = "
+                          "WPA2-PSK/CCMP advertisement)")
     inj.add_argument("--bssid", default="",
-                     help="kick modes (pmf-test/deauth): YOUR AP's BSSID "
-                          "(unicast, required)")
+                     help="kick modes: YOUR AP's BSSID (unicast, required); "
+                          "evil-twin: override the advertised clone BSSID "
+                          "(default: a random locally-administered address, "
+                          "which is the anomaly your warden should catch)")
     inj.add_argument("--client", default="",
                      help="kick modes: YOUR own test device's MAC (unicast, "
                           "required; broadcast/multicast targets are refused)")
@@ -368,6 +379,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="pmf-test: observe client activity before the burst")
     inj.add_argument("--verify-s", type=float, default=8.0,
                      help="pmf-test: observe for re-association after the burst")
+    inj.add_argument("--duration", type=float, default=20.0,
+                     help="evil-twin drill: how many seconds to beacon "
+                          "(hard-capped; self-terminates)")
     inj.add_argument("--token", default="", help="canary: marker SSID (auto if "
                                                  "blank; grep this in sensor logs)")
     inj.add_argument("--src-mac", default="",
@@ -379,9 +393,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="assert you own the target network / hold written "
                           "authorization to test it (required with --transmit)")
     inj.add_argument("--yes", action="store_true",
-                     help="required for kick modes (pmf-test, deauth): "
-                          "acknowledge the named client will be disconnected "
-                          "if management-frame protection is not enforced")
+                     help="required for the impact modes (pmf-test, deauth, "
+                          "evil-twin): acknowledge the test may disconnect the "
+                          "named client or beacons an impersonated SSID you "
+                          "own; the action is bounded and audited")
     inj.add_argument("--airmon", action="store_true")
     inj.add_argument("--no-monitor-setup", action="store_true")
     inj.add_argument("--audit-log", default="",
@@ -1294,10 +1309,18 @@ def cmd_inject(args) -> int:
 
     mode = args.mode
     bssid = client = ""
+    twin = {}
     try:
         if mode in ij.KICK_MODES:
             bssid, client = ij.validate_kick_targets(args.bssid, args.client,
                                                      mode)
+        if mode == "evil-twin":
+            channel = (ij.parse_channels(args.channels) or [6])[0]
+            t_ssid, t_ch, t_sec, t_bssid = ij.validate_twin(
+                args.ssid, channel, args.security, args.bssid)
+            twin = {"ssid": t_ssid, "channel": t_ch, "security": t_sec,
+                    "bssid": t_bssid,
+                    "duration": ij.clamp_twin_duration(args.duration)}
         # Consent + privilege gates (raise InjectionError with a clear reason).
         ij.gate_transmission(mode, transmit=args.transmit,
                              authorized=args.authorized,
@@ -1335,11 +1358,18 @@ def cmd_inject(args) -> int:
     try:
         if not transmit:
             print("DRY RUN: no frames will be transmitted. Add --transmit "
-                  "--authorized" + (" --yes" if mode in ij.KICK_MODES else "") +
+                  "--authorized" + (" --yes" if mode in ij.CONFIRM_MODES
+                                    else "") +
                   " to actually emit. Preview:\n")
             inj = ij.Injector(iface, mode=mode, dry_run=True, audit=audit,
                               src_mac=src_mac)
-            _build_preview(inj, mode, channels, args)
+            _build_preview(inj, mode, channels, args, twin)
+            if mode == "evil-twin":
+                n_beacons = int(twin["duration"] / ij.BEACON_INTERVAL_S)
+                n_beacons = min(n_beacons, ij.MAX_TWIN_BEACONS)
+                print(f"(would transmit ~{n_beacons} beacons over "
+                      f"{twin['duration']:.0f}s on channel {twin['channel']}; "
+                      "1 shown above; beacon-only, no client path)")
             print(f"\naudit trail: {audit_path}")
             print(f"frames built: {inj.built}; frames transmitted: 0")
             return 0
@@ -1350,7 +1380,7 @@ def cmd_inject(args) -> int:
         audit.close()
 
 
-def _build_preview(inj, mode, channels, args) -> None:
+def _build_preview(inj, mode, channels, args, twin=None) -> None:
     """Populate the audit log in dry-run mode and show the would-be frames."""
     if mode == "probe":
         ssids = [s.strip() for s in args.ssid.split(",") if s.strip()] or [""]
@@ -1359,6 +1389,17 @@ def _build_preview(inj, mode, channels, args) -> None:
         token = args.token or ij.new_canary_token()
         print(f"canary token: {token}\n")
         inj.canary_sweep(channels, token, ij.clamp_count("canary", args.count))
+    elif mode == "evil-twin":
+        t = twin or {}
+        print(f"evil-twin drill: beacons advertising SSID={t.get('ssid')!r} "
+              f"from spoofed BSSID {t.get('bssid')} on channel "
+              f"{t.get('channel')} ({t.get('security')}) - beacon ONLY, no "
+              "probe/assoc/auth/data path.\n")
+        pkt = ij.build_beacon(t.get("bssid"), t.get("ssid"),
+                              t.get("channel", 6), t.get("security", "open"))
+        inj._emit(pkt, frame="beacon", channel=str(t.get("channel", "")),
+                  target=t.get("bssid", ""),
+                  detail=f"ssid={t.get('ssid')} sec={t.get('security')}")
     elif mode in ij.KICK_MODES:
         bssid, client = ij.validate_kick_targets(args.bssid, args.client, mode)
         n = ij.clamp_count(mode, args.count)
@@ -1378,6 +1419,23 @@ def _inject_live(args, ij, mode, iface, channels, count, bssid, client,
 
     def _run(tx_iface: str) -> dict:
         inj.iface = tx_iface
+        if mode == "evil-twin":
+            # Beacon-only drill: channel-locked, self-terminating. We listen
+            # on the same channel while beaconing purely so a local warden
+            # run would observe it; no probe/assoc/auth/data frames are sent.
+            t = twin
+            dur = t["duration"]
+            listener = ij.AirListener(tx_iface, dur + 2.0,
+                                      pcap_path=pcap_path)
+            listener.start()
+            n = inj.twin_beacons(t["ssid"], t["bssid"], t["channel"],
+                                 t["security"], dur)
+            print(f"transmitted {n} beacon(s) advertising {t['ssid']!r} "
+                  f"from {t['bssid']} (ch {t['channel']}, {t['security']}) "
+                  "for the drill window; stopping.")
+            listener.join()
+            return ij.twin_drill_report(t["ssid"], t["bssid"], t["channel"],
+                                        t["security"], n, dur)
         if mode in ij.KICK_MODES:
             ij._set_channel(tx_iface, channels[0])
             dur = args.baseline_s + args.verify_s + 2.0
@@ -1477,6 +1535,9 @@ def _inject_live(args, ij, mode, iface, channels, count, bssid, client,
     else:
         print_rows(f"Injection result ({rep.get('mode')})",
                    [(k, k) for k in rep], [rep])
+        if mode == "evil-twin":
+            print("\nThis was a BEACON-ONLY drill - it cannot accept clients. "
+                  "Verify detection:\n  " + str(rep.get("verify", "")))
     print(f"\ntransmitted {inj.sent} frame(s); audit trail: {audit_path}")
     if pcap_path and os.path.exists(pcap_path):
         print(f"verification capture: {pcap_path}")

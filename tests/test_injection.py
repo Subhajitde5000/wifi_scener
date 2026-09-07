@@ -99,6 +99,125 @@ def test_random_local_mac_is_unicast_and_locally_administered():
         assert not ij.is_multicast(mac)
 
 
+# ------------------------------------------------------- evil-twin beacon
+
+def test_build_beacon_is_beacon_only_with_correct_ie():
+    from scapy.all import Dot11
+    from scapy.layers.dot11 import Dot11Beacon, Dot11Elt
+    pkt = ij.build_beacon("02:11:22:33:44:55", "HomeFiber", 6, "open")
+    d = pkt.getlayer(Dot11)
+    assert d.type == 0 and d.subtype == 8
+    assert ij.normalize(d.addr1) == "FF:FF:FF:FF:FF:FF"   # broadcast
+    assert ij._elt_ssid(pkt) == "HomeFiber"
+    assert pkt.haslayer(Dot11Beacon)
+    # open clone advertises NO RSN and no privacy bit
+    elts = pkt.getlayer(Dot11Elt)
+    ids = []
+    while elts is not None:
+        ids.append(elts.ID)
+        elts = elts.payload.getlayer(Dot11Elt)
+    assert 48 not in ids                     # no RSN for open
+    w2 = ij.build_beacon("02:66:77:88:99:AA", "HomeFiber", 11, "wpa2")
+    w2d = w2.getlayer(Dot11Beacon)
+    assert int(w2d.cap) & 0x10               # privacy bit set for WPA2
+    # beacon-only: a beacon frame, with NO auth/assoc/response layer that a
+    # client could complete a connection through
+    from scapy.layers.dot11 import (Dot11AssoReq, Dot11AssoResp, Dot11Auth)
+    for cls in (Dot11AssoReq, Dot11AssoResp, Dot11Auth):
+        assert not pkt.haslayer(cls)
+        assert not w2.haslayer(cls)
+
+
+def test_validate_twin_refuses_blank_and_bad_security():
+    try:
+        ij.validate_twin("", 6, "open")
+        assert False
+    except ij.InjectionError:
+        pass
+    try:
+        ij.validate_twin("HomeFiber", 6, "wpa3-clone")
+        assert False
+    except ij.InjectionError:
+        pass
+    try:
+        ij.validate_twin("HomeFiber", 6, "open", bssid="FF:FF:FF:FF:FF:FF")
+        assert False
+    except ij.InjectionError:
+        pass
+    ssid, ch, sec, bssid = ij.validate_twin("HomeFiber", 6, "open")
+    assert ssid == "HomeFiber" and ch == 6 and sec == "open"
+    assert bssid and not ij.is_multicast(bssid)     # default random LAA
+    # explicit bssid honoured
+    _, _, _, b2 = ij.validate_twin("HomeFiber", 11, "wpa2", "AA:BB:CC:00:00:01")
+    assert b2 == "AA:BB:CC:00:00:01"
+
+
+def test_gate_evil_twin_requires_yes():
+    try:
+        ij.gate_transmission("evil-twin", transmit=True, authorized=True,
+                             confirmed=False, _root=True)
+        assert False
+    except ij.InjectionError as exc:
+        assert "--yes" in str(exc) and "beacon-only" in str(exc)
+    ij.gate_transmission("evil-twin", transmit=True, authorized=True,
+                         confirmed=True, _root=True)
+
+
+def test_twin_duration_capped():
+    assert ij.clamp_twin_duration(9999) == ij.MAX_TWIN_DURATION_S
+    assert ij.clamp_twin_duration(10) == 10.0
+
+
+def test_twin_beacons_dry_run_sends_none_and_live_is_bounded():
+    import scapy.all as sc
+    with tempfile.TemporaryDirectory() as td:
+        audit = ij.AuditLog(os.path.join(td, "a.csv"))
+        # dry run
+        inj = ij.Injector("wlan0", mode="evil-twin", dry_run=True, audit=audit)
+        n = inj.twin_beacons("HomeFiber", "02:11:22:33:44:55", 6, "open", 5.0)
+        assert n == 1 and inj.sent == 0
+        # live (mocked sendp) must self-terminate and stay under the cap
+        sent = []
+        orig = sc.sendp
+        sc.sendp = lambda pkt, **k: sent.append(pkt)
+        try:
+            inj2 = ij.Injector("wlan0", mode="evil-twin", dry_run=False,
+                               audit=audit, interval=ij.BEACON_INTERVAL_S)
+            n2 = inj2.twin_beacons("HomeFiber", "02:11:22:33:44:55", 6, "open",
+                                   2.0)
+        finally:
+            sc.sendp = orig
+            audit.close()
+        assert len(sent) == n2
+        assert 0 < n2 <= ij.MAX_TWIN_BEACONS
+        assert inj2.sent == n2
+        # every frame is a beacon, never assoc/auth/data
+        from scapy.all import Dot11
+        assert all(p.getlayer(Dot11).subtype == 8 for p in sent)
+
+
+def test_evil_twin_clone_is_detected_as_rogue_and_warden():
+    """The beacon-only drill must trip BOTH detectors, with no serving AP."""
+    from wifiscanner.engine import Engine
+    from wifiscanner.models import AccessPoint
+    from wifiscanner.defense import Watchdog
+    clone = ij.build_beacon("02:11:22:33:44:55", "HomeFiber", 6, "open")
+    sn = __import__("wifiscanner.backends.sniffer", fromlist=["MonitorSniffer"]).MonitorSniffer(iface="offline")
+    sn._handle(clone)
+    eng = Engine()
+    eng.ingest([AccessPoint(bssid="F0:9F:C2:11:22:33", ssid="HomeFiber",
+                            vendor="Ubiquiti", security=["WPA2"], channel=6,
+                            frequency=2437, rssi=-50)])
+    eng.ingest(sn.results())
+    rogues = eng.rogue_candidates(known_bssids={"F0:9F:C2:11:22:33"})
+    assert any(r["verdict"] == "likely-rogue" and "open-clone" in r["indicators"]
+               for r in rogues)
+    wd = Watchdog(window_s=60, cooldown_s=0,
+                  known_bssids={"F0:9F:C2:11:22:33"})
+    wd.feed(clone)
+    assert "unknown-bss" in {a.kind for a in wd.alerts}
+
+
 # ------------------------------------------------------------------ gating
 
 def test_gate_dry_run_needs_nothing():
@@ -413,6 +532,38 @@ def test_cli_deauth_dry_run_alternates_frames_and_transmits_nothing():
         assert frames == ["deauth", "disassoc", "deauth", "disassoc"]
         assert all(r["tx"] == "0" and r["dry_run"] == "1" for r in rows)
         assert not os.path.exists(os.path.join(td, "deauth.pcap"))
+
+
+def test_cli_evil_twin_dry_run_and_gates():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with tempfile.TemporaryDirectory() as td:
+        # dry run: advertises the clone, transmits nothing, writes audit
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "inject", "--mode", "evil-twin", "--ssid",
+                            "OwnNet", "--security", "open", "-c", "6", "-i",
+                            "wlan0", "--duration", "5", "-o", td],
+                           cwd=root, capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0, p.stderr
+        assert "beacon ONLY" in p.stdout and "transmitted: 0" in p.stdout
+        import csv as _csv
+        with open(os.path.join(td, "injection_audit.csv"),
+                  encoding="utf-8-sig") as fh:
+            rows = list(_csv.DictReader(fh))
+        assert rows and rows[0]["frame"] == "beacon"
+        assert rows[0]["dry_run"] == "1"
+    # transmit without --yes is refused
+    p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                        "inject", "--mode", "evil-twin", "--ssid", "OwnNet",
+                        "-i", "wlan0", "--transmit", "--authorized",
+                        "-o", "/tmp/inj-et1"],
+                       cwd=root, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2 and "--yes" in (p.stderr + p.stdout)
+    # missing ssid is refused
+    p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                        "inject", "--mode", "evil-twin", "-i", "wlan0",
+                        "-o", "/tmp/inj-et2"],
+                       cwd=root, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2 and "--ssid" in (p.stderr + p.stdout)
 
 
 def test_cli_deauth_requires_yes_and_refuses_broadcast():

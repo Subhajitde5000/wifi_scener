@@ -20,6 +20,18 @@ passive listening alone cannot:
       pmf-test probe but still hard-capped, one-shot, logged and target-
       restricted - a pen-test action, never a sustained attack.
 
+4. "Does my IDS actually catch an Evil Twin / rogue AP beacons MY SSID?"
+   -> ``mode=evil-twin``  a bounded, authorised *detection drill*: it
+      transmits BEACON FRAMES ONLY that advertise a network name you own from
+      a fresh, locally-administered BSSID, for a few seconds on one channel,
+      so you can confirm your warden baseline / `ids` flags the spoofed BSSID
+      and your `scan` rogue heuristics flag the same-SSID clone. There is
+      deliberately NO association/authentication/EAPOL/DHCP/data path: the
+      drill cannot accept a client, capture a handshake or credential, or
+      relay traffic - a beaconing radio that never answers is not a working
+      AP and cannot be used as one. It self-terminates after a hard-capped
+      window and every beacon is audited.
+
 ``mode=probe`` is ordinary active scanning - byte-for-byte the same probe
 requests every laptop/phone OS broadcasts while scanning for networks; it
 makes the survey deterministic instead of waiting for beacons.
@@ -77,20 +89,29 @@ MAX_KICK_BURST = 30              # deauth mode: hard one-shot total frame cap
 MIN_FRAME_INTERVAL_S = 0.30       # floor between transmitted frames
 DEFAULT_FRAME_INTERVAL_S = 0.45
 KICK_FRAME_INTERVAL_S = 0.30      # kick bursts use the floor spacing
+BEACON_INTERVAL_S = 0.30         # evil-twin drill: ~3 beacons/s, like a real AP
+MAX_TWIN_DURATION_S = 60.0       # a drill self-terminates after this at most
+DEFAULT_TWIN_DURATION_S = 20.0
+MAX_TWIN_BEACONS = 240           # hard ceiling on total beacons per run
 DEFAULT_DWELL_S = 2.5             # listen per channel after a probe burst
 PMF_BASELINE_S = 5.0             # observe client activity before the burst
 PMF_VERIFY_S = 8.0              # observe after the burst for re-association
 DEAUTH_REASON = 7               # Class-3 frame from non-associated STA (standard)
 DISASOC_REASON = 8            # Disassoc: disassociate due to STA leaving
+BEACON_INTERVAL_TU = 100        # 100 TU ~= 0.102 s (advertised, not the TX gap)
 
 # 802.11 management-frame subtypes (IEEE 802.11).
-SUBTYPE_DEAUTH = 12
-SUBTYPE_DISASSOC = 10
 SUBTYPE_ASSOC_REQ = 0
+SUBTYPE_DISASSOC = 10
+SUBTYPE_AUTH = 11
+SUBTYPE_DEAUTH = 12
 SUBTYPE_REASSOC_REQ = 2
 
-# Modes that send disconnect frames and therefore need the extra --yes gate.
+# Modes that need the extra --yes acknowledgement (any frame that could
+# disconnect a client or present an impersonated network).
 KICK_MODES = ("pmf-test", "deauth")
+CONFIRM_MODES = ("pmf-test", "deauth", "evil-twin")
+TWIN_SECURITIES = ("open", "wpa2")
 
 BROADCAST = "FF:FF:FF:FF:FF:FF"
 CANARY_PREFIX = "WIFISCANNER-CANARY-"
@@ -183,6 +204,43 @@ def build_disassoc(bssid: str, client: str, reason: int = DISASOC_REASON,
             / Dot11Disas(reason=reason))
 
 
+# A minimal, valid WPA2-PSK/CCMP RSN information element (IE 48). It is only
+# enough to make the *beacon* advertise "WPA2" so the clone is recognisable;
+# there is no associated state machine to act on it.
+_RSN_WPA2_PSK_CCMP = bytes.fromhex(
+    "30140100000fac020200000fac040100000fac020c00")
+
+
+def build_beacon(bssid: str, ssid: str, channel: int = 6,
+                 security: str = "open"):
+    """One 802.11 beacon that *advertises* a network (the Evil-Twin drill).
+
+    Beacons are what every access point broadcasts ~10x/second to announce
+    its presence. Emitting one is what a fake/rogue AP does to be SEEN - but
+    a beacon alone cannot serve anyone: a real AP must also answer probe
+    requests, authenticate, associate and run a DHCP/data path. This builder
+    (and the injector) deliberately create ONLY the beacon, so the result is
+    detectable as a rogue BSSID yet cannot accept a client or intercept
+    traffic. ``security="open"`` advertises no RSN (the classic open-clone);
+    ``security="wpa2"`` advertises WPA2-PSK/CCMP.
+    """
+    from scapy.all import Dot11, Dot11Beacon, Dot11Elt, RadioTap
+    bssid = normalize(bssid)
+    # cap ESS(0x1) + privacy bit for WPA2 (0x10)
+    cap = 0x0011 if security == "wpa2" else 0x0001
+    pkt = (RadioTap()
+           / Dot11(type=0, subtype=8, addr1=BROADCAST, addr2=bssid,
+                   addr3=bssid)
+           / Dot11Beacon(cap=cap, beacon_interval=BEACON_INTERVAL_TU))
+    pkt /= Dot11Elt(ID=0, info=(ssid or "").encode("utf-8", "replace"))
+    pkt /= Dot11Elt(ID=1, info=bytes([0x82, 0x84, 0x8B, 0x96,
+                                      0x0C, 0x12, 0x18, 0x24]))
+    pkt /= Dot11Elt(ID=3, info=bytes([channel & 0xFF]))          # DS parameter
+    if security == "wpa2":
+        pkt /= Dot11Elt(ID=48, info=_RSN_WPA2_PSK_CCMP)
+    return pkt
+
+
 # ------------------------------------------------------------- frame anatomy
 
 def frame_summary(pkt) -> str:
@@ -196,6 +254,8 @@ def frame_summary(pkt) -> str:
     if t == 0 and st == 4:
         ssid = _elt_ssid(pkt)
         return f"probe-request  {d.addr2} -> broadcast  SSID={ssid or '<wildcard>'!r}"
+    if t == 0 and st == 8:
+        return f"beacon  {d.addr2} -> broadcast  SSID={_elt_ssid(pkt) or '<hidden>'!r}"
     if t == 0 and st == 5:
         return f"probe-response {d.addr2} -> {d.addr1}"
     if t == 0 and st in (SUBTYPE_DEAUTH, SUBTYPE_DISASSOC):
@@ -250,6 +310,12 @@ def gate_transmission(mode: str, *, transmit: bool, authorized: bool,
             "protection is NOT in force. It requires --yes in addition to "
             "--authorized/--transmit, plus an explicit unicast --bssid "
             "(YOUR AP) and --client (YOUR test device).")
+    if mode == "evil-twin" and not confirmed:
+        raise InjectionError(
+            "evil-twin transmits beacons that IMPERSONATE an SSID. This is "
+            "a detection drill for a network name YOU own: it requires --yes "
+            "in addition to --authorized/--transmit, and is beacon-only "
+            "(it cannot accept clients or relay traffic).")
     if not root:
         raise InjectionError(
             "over-the-air injection requires root privileges (run with sudo). "
@@ -276,16 +342,59 @@ def validate_kick_targets(bssid: str, client: str, mode: str = "pmf-test"
 validate_pmf_targets = validate_kick_targets
 
 
+def validate_twin(ssid: str, channel: int, security: str,
+                  bssid: str = "") -> Tuple[str, int, str, str]:
+    """Validate an evil-twin detection drill and resolve its advertised BSSID.
+
+    The SSID must be a network name YOU own (the drill impersonates your own
+    SSID to test YOUR sensors); an empty SSID is refused (hidden/blank clones
+    serve no detection-drill purpose). BSSID defaults to a fresh random
+    locally-administered address so it will NOT match the real AP's BSSID -
+    that is precisely the anomaly the warden/rogue heuristics should catch.
+    """
+    ssid = (ssid or "").strip()
+    if not ssid:
+        raise InjectionError(
+            "evil-twin drill requires --ssid <YOUR-OWN-network-name>. It "
+            "beacons a spoofed BSSID advertising that SSID so your IDS/warden "
+            "can be tested - blank SSIDs are refused.")
+    if security not in TWIN_SECURITIES:
+        raise InjectionError(
+            f"unsupported --security {security!r}; use 'open' (the classic "
+            "open-clone) or 'wpa2'.")
+    channel = int(channel) if channel else 6
+    if not (1 <= channel <= 196):
+        raise InjectionError(f"invalid channel {channel}")
+    if bssid:
+        bssid = normalize(bssid)
+        if is_multicast(bssid):
+            raise InjectionError(
+                f"--bssid {bssid} is broadcast/multicast; a beaconing BSSID "
+                "must be a unicast address.")
+    else:
+        bssid = random_local_mac()
+    return ssid, channel, security, bssid
+
+
 def clamp_count(mode: str, count: int, *, per_channel: bool = False) -> int:
     cap = {"probe": MAX_PROBE_PER_CHANNEL,
            "canary": MAX_CANARY_PER_CHANNEL,
            "pmf-test": MAX_DEAUTH_BURST,
-           "deauth": MAX_KICK_BURST}[mode]
+           "deauth": MAX_KICK_BURST,
+           "evil-twin": MAX_TWIN_BEACONS}[mode]
     if count > cap:
         scope = "per channel" if per_channel else "per run"
         log.warning("requested %d frames capped to the hard safety limit of "
                     "%d (%s) for mode %s", count, cap, scope, mode)
     return max(1, min(int(count), cap))
+
+
+def clamp_twin_duration(duration_s: float) -> float:
+    d = max(1.0, float(duration_s or DEFAULT_TWIN_DURATION_S))
+    if d > MAX_TWIN_DURATION_S:
+        log.warning("evil-twin duration capped to %.0fs (a detection drill "
+                    "self-terminates)", MAX_TWIN_DURATION_S)
+    return min(d, MAX_TWIN_DURATION_S)
 
 
 def parse_channels(spec: str, default: Optional[List[int]] = None) -> List[int]:
@@ -554,6 +663,27 @@ class Injector:
         """Backwards-compatible deauth-only burst used by the pmf-test."""
         self.kick_burst(bssid, client, count, frame_type="deauth")
 
+    def twin_beacons(self, ssid: str, bssid: str, channel: int,
+                     security: str, duration_s: float) -> int:
+        """Transmit a bounded beacon train that *advertises* a cloned SSID.
+
+        Detection drill only: sends beacon frames for ``duration_s`` (hard-
+        capped, self-terminating), channel-locked, NO probe-response/assoc/
+        auth/data path. Returns the number of beacons sent.
+        """
+        if not self.dry_run:
+            _set_channel(self.iface, channel)
+        end = time.time() + duration_s
+        n = 0
+        while n < MAX_TWIN_BEACONS and (self.dry_run or time.time() < end):
+            pkt = build_beacon(bssid, ssid, channel, security)
+            self._emit(pkt, frame="beacon", channel=str(channel),
+                       target=bssid, detail=f"ssid={ssid} sec={security}")
+            n += 1
+            if self.dry_run:
+                break          # dry run previews one representative beacon
+        return n
+
 
 def _set_channel(iface: str, channel: int) -> bool:
     from .backends.sniffer import set_channel
@@ -647,6 +777,23 @@ def canary_results(events: List[AirEvent], src_mac: str, token: str) -> dict:
             "note": ("markers heard on this radio; remote sensors must each "
                      "be checked with `ids`/`capture`/`traffic` and grepped "
                      f"for token {token}")}
+
+
+def twin_drill_report(ssid: str, bssid: str, channel: int,
+                      security: str, beacons: int, duration_s: float) -> dict:
+    """How to confirm your IDS/warden caught the beacon-only clone."""
+    return {"mode": "evil-twin", "ssid": ssid, "bssid": bssid,
+            "channel": channel, "security": security,
+            "beacons_transmitted": beacons, "duration_s": round(duration_s, 1),
+            "association_path": "none (beacon-only drill: cannot serve clients)",
+            "verify": (
+                f"1) baseline first:  wifiscanner ids --db warden.sqlite "
+                f"--learn   (on a normal scan); "
+                f"2) run this drill; "
+                f"3) wifiscanner ids --db warden.sqlite -i wlan0mon  must "
+                f"raise unknown-bss for {bssid}; "
+                f"4) wifiscanner scan  must list {ssid!r} twice (real + clone) "
+                f"and *_rogue_alerts.csv must flag the same-SSID clone")}
 
 
 # --------------------------------------------------------- IDS self-test
