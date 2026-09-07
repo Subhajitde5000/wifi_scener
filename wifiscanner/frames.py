@@ -220,13 +220,16 @@ def annotate_pcap(path: str, limit: int = 20, filt: str = "",
         tag = {12: "deauth", 11: "disassoc", 8: "beacon", 4: "probe-req",
                5: "probe-resp", 0: "assoc-req", 1: "assoc-resp"}.get(st, "") \
             if t == 0 else ("data" if t == 2 else "control")
-        if filt and filt.lower() not in (tag + str(t) + str(st)).lower():
-            continue
-        blk = annotate(pkt, n)
+        e = ""
         if tag == "data":
             e = eapol_flags(pkt)
             if e:
-                blk += f"\n  eapol: {e}"
+                tag += " handshake"
+        if filt and filt.lower() not in (tag + str(t) + str(st)).lower():
+            continue
+        blk = annotate(pkt, n)
+        if e:
+            blk += f"\n  eapol: {e}"
         out.append(blk)
         if len(out) >= limit:
             break
