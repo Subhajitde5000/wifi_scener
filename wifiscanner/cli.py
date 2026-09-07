@@ -75,6 +75,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="also persist this scan into a history database")
         sp.add_argument("--sensor", default="", metavar="NAME",
                         help="tag stored rows with this sensor id (multi-AP setups)")
+        sp.add_argument("--retain-days", type=float, default=90.0,
+                        help="history retention for --db (0 = keep forever, "
+                             "not recommended)")
+        sp.add_argument("--privacy-mode", default="standard",
+                        choices=["standard", "minimal", "ephemeral"],
+                        help="minimal = pseudonymised MACs, no hostnames/probes; "
+                             "ephemeral = refuse all persistence")
+        sp.add_argument("--anonymize", action="store_true",
+                        help="pseudonymise client MACs in exports (salted, "
+                             "per-export, unlinkable)")
         return sp
 
     s = common(sub.add_parser("scan", help="survey nearby access points"))
@@ -157,6 +167,15 @@ def build_parser() -> argparse.ArgumentParser:
                      choices=["auto", "nmcli", "iw", "iwlist", "airport", "netsh"])
     rec.add_argument("--pcap", default="",
                      help="one-shot: import an existing capture into the DB and exit")
+    rec.add_argument("--retain-days", type=float, default=90.0,
+                     help="history retention in days (0 = keep forever, "
+                          "not recommended)")
+    rec.add_argument("--privacy-mode", default="standard",
+                     choices=["standard", "minimal", "ephemeral"],
+                     help="minimal = pseudonymised MACs, no hostnames; "
+                          "ephemeral = refuse to persist")
+    rec.add_argument("--anonymize", action="store_true",
+                     help="store salted MAC pseudonyms instead of real MACs")
 
     pr = sub.add_parser("presence", help="query presence history: who was on, when")
     pr.add_argument("--db", default="presence.sqlite")
@@ -220,6 +239,15 @@ def build_parser() -> argparse.ArgumentParser:
                      help="keep only N segment files (bounded ring buffer)")
     cap.add_argument("--analyze", action="store_true",
                      help="also parse the capture into AP/client tables at exit")
+    cap.add_argument("--ack-sensitive", action="store_true",
+                     help="acknowledge that raw captures contain sensitive "
+                          "third-party data (silences the warning)")
+    cap.add_argument("--strip-payloads", action="store_true",
+                     help="privacy-preserving capture: truncate frames to 128 "
+                          "bytes (headers for counting/IDS, no payloads)")
+    cap.add_argument("--max-age-days", type=float, default=0.0,
+                     help="delete capture segments older than N days on exit "
+                          "(0 = keep)")
     cap.add_argument("--airmon", action="store_true")
     cap.add_argument("--no-monitor-setup", action="store_true")
 
@@ -235,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
     trf.add_argument("--limit", type=int, default=40)
     trf.add_argument("-o", "--output", default="", help="export events/flows CSV here")
     trf.add_argument("--prefix", default="traffic")
+    trf.add_argument("--no-redact", action="store_true",
+                     help="disable URL/User-Agent redaction (NOT recommended; "
+                          "logs sensitive cleartext verbatim)")
+    trf.add_argument("--anonymize-ips", action="store_true",
+                     help="mask IPs to /24 in events/flows (for shared reports)")
     trf.add_argument("--airmon", action="store_true")
     trf.add_argument("--no-monitor-setup", action="store_true")
 
@@ -247,6 +280,10 @@ def build_parser() -> argparse.ArgumentParser:
     ids.add_argument("--pcap", default="", help="analyse an existing capture instead")
     ids.add_argument("--window", type=float, default=10.0, help="anomaly window (s)")
     ids.add_argument("--flood", type=int, default=5, help="mgmt frames in window that count as flood")
+    ids.add_argument("--sensitivity", default="medium",
+                     choices=["low", "medium", "high"],
+                     help="low = fewer, surer alerts (2x threshold); "
+                          "high = more, noisier alerts")
     ids.add_argument("--db", default="", help="warden baseline sqlite (learn/unknown BSSIDs)")
     ids.add_argument("--learn", action="store_true", help="save current APs as known-good baseline")
     ids.add_argument("--airmon", action="store_true")
@@ -270,6 +307,25 @@ def build_parser() -> argparse.ArgumentParser:
                     help="beacon|probe-req|assoc-req|deauth|disassoc|data|handshake")
     fr.add_argument("--handshakes", action="store_true",
                     help="just summarise EAPOL/deauth activity (counts only)")
+
+    dbp = sub.add_parser("db", help="history-database maintenance: retention, "
+                         "anonymization, deletion (privacy controls)")
+    dbp.add_argument("--db", default="presence.sqlite", metavar="SQLITE")
+    dbp.add_argument("--report", action="store_true",
+                     help="show permissions/size/retention/tables report")
+    dbp.add_argument("--prune-days", type=float, default=0.0,
+                     help="delete rows older than N days, then vacuum")
+    dbp.add_argument("--delete-mac", default="",
+                     help="erase every row for one device MAC (or pseudonym)")
+    dbp.add_argument("--anonymize-db", action="store_true",
+                     help="IRREVERSIBLY pseudonymise stored MACs + drop IPs/ "
+                          "hostnames (no undo)")
+    dbp.add_argument("--purge", action="store_true",
+                     help="delete ALL history rows (keeps warden baseline)")
+    dbp.add_argument("--vacuum", action="store_true",
+                     help="reclaim space after deletions")
+    dbp.add_argument("--yes", action="store_true",
+                     help="confirm destructive actions (required)")
 
     sub.add_parser("interfaces", help="list wireless interfaces and capabilities")
     return p
@@ -338,16 +394,25 @@ def _do_monitor(args, eng: Engine, duration: float, bssid: str = "") -> Engine:
 def _export(args, eng: Engine) -> None:
     if not args.output:
         return
-    files = export_all(eng, args.output, args.prefix, tuple(args.format))
+    files = export_all(eng, args.output, args.prefix, tuple(args.format),
+                       anonymize=getattr(args, "anonymize", False))
     msg = "\n".join(f"  -> {f}" for f in files)
-    print(f"\nExported {len(files)} file(s):\n{msg}")
+    anon = " (anonymized: salted pseudonyms, no hostnames/IPs/probes)" \
+        if getattr(args, "anonymize", False) else " (owner-only permissions)"
+    print(f"\nExported {len(files)} file(s){anon}:\n{msg}")
 
 
 def _maybe_store(args, eng: Engine, mode: str = "scan") -> None:
     db = getattr(args, "db", "")
     if not db:
         return
-    st = Store(db)
+    try:
+        st = Store(db, retention_days=getattr(args, "retain_days", 90.0),
+                   privacy_mode=getattr(args, "privacy_mode", "standard"),
+                   anonymize=getattr(args, "anonymize", False))
+    except PermissionError as exc:
+        log.error("%s", exc)
+        return
     try:
         sid = st.record_engine(eng, mode=mode, sensor=getattr(args, "sensor", ""))
         print(f"persisted scan {sid} -> {db}")
@@ -519,7 +584,11 @@ def cmd_own(args) -> int:
         eng.ingest_lan(lan.lan_inventory(do_ports=args.ports),
                        bssid_hint=my_bssid)
     if ap_clients:
-        eng.ingest_lan(ap_clients, bssid_hint=my_bssid)
+        # The AP's own kernel table is ground truth: router-CONFIRMED.
+        eng.ingest_lan(ap_clients, bssid_hint=my_bssid, authoritative=True)
+        print(f"router association table confirmed "
+              f"{len(ap_clients)} client(s) — these counts are fact, "
+              f"everything else RF-observed is an estimate")
 
     ap = eng.aps.get(normalize(my_bssid)) if my_bssid else None
     if ap:
@@ -535,6 +604,14 @@ def cmd_own(args) -> int:
 
 def cmd_record(args) -> int:
     """Continuous presence recorder, scoped to your own network(s) only."""
+    try:
+        st0 = Store(args.db, retention_days=args.retain_days,
+                    privacy_mode=args.privacy_mode,
+                    anonymize=args.anonymize)
+        st0.close()
+    except PermissionError as exc:
+        log.error("%s", exc)
+        return 2
     if args.pcap:
         if not sniffer.scapy_available():
             log.error("scapy required for pcap import")
@@ -543,7 +620,9 @@ def cmd_record(args) -> int:
         sn = sniffer.MonitorSniffer(iface="offline")
         sn.read_pcap(args.pcap)
         eng.ingest(sn.results())
-        st = Store(args.db)
+        st = Store(args.db, retention_days=args.retain_days,
+                   privacy_mode=args.privacy_mode,
+                   anonymize=args.anonymize)
         try:
             sid = st.record_engine(eng, mode="pcap-import", sensor=args.sensor)
             print(f"imported {args.pcap} into {args.db} as scan {sid}")
@@ -565,7 +644,17 @@ def cmd_record(args) -> int:
                   "use `scan`/`monitor` for ephemeral surveys.")
         return 2
 
-    st = Store(args.db)
+    st = Store(args.db, retention_days=args.retain_days,
+               privacy_mode=args.privacy_mode,
+               anonymize=args.anonymize)
+    if args.retain_days:
+        print(f"retention: rows older than {args.retain_days:g} days are "
+              f"pruned automatically")
+    else:
+        print("retention DISABLED (rows kept forever) — not recommended; "
+              "see `db --prune-days`")
+    if st.anonymize:
+        print("privacy: storing salted MAC pseudonyms, no hostnames/IPs")
     t_end = time.time() + args.duration if args.duration else 0.0
     n = 0
     try:
@@ -638,6 +727,7 @@ def cmd_presence(args) -> int:
               f"{max(args.gap * 2, 60):.0f}s)")
         if args.output:
             import csv as _csv
+            from .privacy import secure_file
             os.makedirs(args.output, exist_ok=True)
             path = os.path.join(args.output, "presence_sessions.csv")
             with open(path, "w", newline="", encoding="utf-8-sig") as fh:
@@ -647,6 +737,7 @@ def cmd_presence(args) -> int:
                     extrasaction="ignore")
                 w.writeheader()
                 w.writerows(rows)
+            secure_file(path)
             print(f"exported -> {path}")
         return 0
     finally:
@@ -691,11 +782,18 @@ def cmd_locate(args) -> int:
                               f.method, f.sensors) for f in fixes])
         rows = [dict(ts=_fmt_ts(f.ts), mac=f.mac, x=f.x, y=f.y,
                      unc=f.uncertainty_m, zone=f.zone, method=f.method,
-                     sensors=f.sensors) for f in fixes[-80:]]
-        print_rows(f"Position fixes ({len(fixes)} computed, showing latest {len(rows)})",
+                     conf=f.confidence, zone_conf=f.zone_confidence,
+                     sensors=f.sensors, answer=f.display)
+                for f in fixes[-80:]]
+        print_rows(f"Position fixes ({len(fixes)} computed, showing latest {len(rows)}) — "
+                   f"ZONE is the primary answer; coordinates are shown only "
+                   f"when confidence is medium/high",
                    [("Time", "ts"), ("MAC", "mac"), ("x", "x"), ("y", "y"),
-                    ("Unc m", "unc"), ("Zone", "zone"), ("Method", "method"),
+                    ("Err±m", "unc"), ("Zone", "zone"), ("ZoneConf", "zone_conf"),
+                    ("Method", "method"), ("Conf", "conf"),
                     ("Sources", "sensors")], rows)
+        for f in fixes[-5:]:
+            print(f"  -> {f.mac} @ {_fmt_ts(f.ts)[11:]}: {f.display}")
         if len(sensors) >= 2 and fixes:
             print()
             print(ascii_map(fixes[-400:], sensors, zones))
@@ -731,11 +829,15 @@ def cmd_trail(args) -> int:
         rows = []
         for f in fixes:
             d = dict(ts=_fmt_ts(f.ts), x=f.x, y=f.y, unc=f.uncertainty_m,
-                     zone=f.zone, method=f.method)
+                     zone=getattr(f, "zone", ""), method=f.method,
+                     conf=getattr(f, "confidence", ""),
+                     answer=getattr(f, "display", ""))
             rows.append(d)
-        print_rows(f"Movement trail for {args.mac} ({len(fixes)} fixes)",
-                   [("Time", "ts"), ("x", "x"), ("y", "y"), ("Unc m", "unc"),
-                    ("Zone", "zone"), ("Method", "method")], rows[-100:])
+        print_rows(f"Movement trail for {args.mac} ({len(fixes)} fixes) — "
+                   f"zone-level answers; low-confidence coordinates withheld",
+                   [("Time", "ts"), ("x", "x"), ("y", "y"), ("Err±m", "unc"),
+                    ("Zone", "zone"), ("Method", "method"), ("Conf", "conf")],
+                   rows[-100:])
         if tracker:
             dwell = tracker.zone_dwell(fixes)
             if dwell:
@@ -750,15 +852,27 @@ def cmd_trail(args) -> int:
             path = os.path.join(args.output,
                                 f"trail-{args.mac.replace(':', '')}.csv")
             import csv as _csv
+            from .privacy import secure_file
             with open(path, "w", newline="", encoding="utf-8-sig") as fh:
                 w = _csv.DictWriter(fh, fieldnames=[
-                    "ts", "time", "mac", "x", "y", "unc_m", "zone", "method"])
+                    "ts", "time", "mac", "x", "y", "unc_m", "error_radius_m",
+                    "zone", "zone_confidence", "method", "confidence",
+                    "sensor_count", "display"])
                 w.writeheader()
                 for f in fixes:
                     w.writerow({"ts": round(f.ts, 1), "time": _fmt_ts(f.ts),
                                 "mac": f.mac, "x": f.x, "y": f.y,
-                                "unc_m": f.uncertainty_m, "zone": f.zone,
-                                "method": f.method})
+                                "unc_m": f.uncertainty_m,
+                                "error_radius_m": getattr(
+                                    f, "error_radius_m", f.uncertainty_m),
+                                "zone": getattr(f, "zone", ""),
+                                "zone_confidence": getattr(
+                                    f, "zone_confidence", ""),
+                                "method": f.method,
+                                "confidence": getattr(f, "confidence", ""),
+                                "sensor_count": getattr(f, "sensor_count", ""),
+                                "display": getattr(f, "display", "")})
+            secure_file(path)
             print(f"exported -> {path}")
         return 0
     finally:
@@ -767,6 +881,11 @@ def cmd_trail(args) -> int:
 
 def cmd_capture(args) -> int:
     """Raw frame capture with rotation / ring buffer. Passive only."""
+    if not args.ack_sensitive:
+        log.warning("raw captures contain sensitive third-party data "
+                    "(payloads, identifiers) — collect only where authorized; "
+                    "add --strip-payloads for a privacy-preserving header-only "
+                    "capture, or --ack-sensitive to silence this warning")
     if not sniffer.scapy_available():
         log.error("scapy required:  pip install scapy")
         return 2
@@ -785,11 +904,18 @@ def cmd_capture(args) -> int:
     sn = sniffer.MonitorSniffer(iface, channels=channels,
                                 hop_interval=args.hop_interval,
                                 bands=tuple(args.bands), lock_bssid=args.bssid)
+    snaplen = 128 if args.strip_payloads else 0
+    if args.strip_payloads:
+        print("privacy-preserving capture: 128-byte snaplen keeps 802.11 "
+              "headers (counting/IDS) and discards payloads")
+    print(f"capture files are written owner-only (0600) to {args.pcap or '.'}; "
+          f"they remain sensitive — store encrypted, delete when done")
 
     def _go(mon):
         sn.iface = mon
         sn.run(args.duration, pcap_out=args.pcap,
-               ring_segments=args.ring_segments, rotate_mb=args.rotate_mb)
+               ring_segments=args.ring_segments, rotate_mb=args.rotate_mb,
+               snaplen=snaplen, secure_storage=True)
 
     try:
         if args.no_monitor_setup:
@@ -802,6 +928,17 @@ def cmd_capture(args) -> int:
         print("\nstopped.")
     stt = sn.stats()
     print_rows("Capture stats", [(k, k) for k in stt], [stt])
+    if args.max_age_days:
+        import glob as _glob
+        base, _ext = os.path.splitext(args.pcap)
+        cutoff = time.time() - args.max_age_days * 86400
+        for f in _glob.glob(base + "*.pcap*"):
+            try:
+                if os.path.getmtime(f) < cutoff:
+                    os.remove(f)
+                    print(f"  retention: deleted expired segment {f}")
+            except OSError as exc:
+                log.warning("retention delete failed for %s: %s", f, exc)
     if args.analyze:
         eng = Engine()
         eng.ingest(sn.results())
@@ -817,6 +954,14 @@ def cmd_traffic(args) -> int:
         log.error("scapy required:  pip install scapy")
         return 2
     from . import traffic as tf
+    redact = not args.no_redact
+    if args.no_redact:
+        log.warning("--no-redact: URL query strings, full User-Agents and "
+                    "hostnames will be logged VERBATIM. Only use on your own "
+                    "network with consent.")
+    else:
+        print("redaction ON (default): URL queries stripped, User-Agents "
+              "reduced to product tokens, credential values never logged")
     if args.live:
         if not is_root():
             log.error("live dissection needs root + a monitor interface")
@@ -826,18 +971,23 @@ def cmd_traffic(args) -> int:
             print(f"{_fmt_ts(ev.ts)[11:]} [{ev.proto}] {ev.src} -> {ev.dst}  "
                   f"{ev.summary}" + (f"  !!{ev.alert}" if ev.alert else ""))
         if args.no_monitor_setup:
-            d = tf.analyze_live(args.interface, args.duration, on_event=show)
+            d = tf.analyze_live(args.interface, args.duration, on_event=show,
+                                redact=redact,
+                                anonymize_ips=args.anonymize_ips)
         else:
             with sniffer.MonitorMode(args.interface,
                                      use_airmon=args.airmon) as mon:
-                d = tf.analyze_live(mon, args.duration, on_event=show)
+                d = tf.analyze_live(mon, args.duration, on_event=show,
+                                    redact=redact,
+                                    anonymize_ips=args.anonymize_ips)
     else:
         if not args.pcap or not os.path.exists(args.pcap):
             log.error("usage: wifiscanner traffic <file.pcap>  (or --live -i wlan0mon)")
             return 2
         print("dissecting cleartext frames only; protected frames are skipped "
               "and counted...")
-        d = tf.analyze_pcap(args.pcap, args.max_frames)
+        d = tf.analyze_pcap(args.pcap, args.max_frames, redact=redact,
+                            anonymize_ips=args.anonymize_ips)
     tf.print_dissector(d, args.limit)
     if d.protected_skipped:
         print(f"note: {d.protected_skipped} protected frames skipped - by "
@@ -851,7 +1001,11 @@ def cmd_traffic(args) -> int:
 # ------------------------------------------------- defense & education
 
 def cmd_ids(args) -> int:
-    wd = Watchdog(window_s=args.window, flood_frames=args.flood)
+    wd = Watchdog(window_s=args.window, flood_frames=args.flood,
+                  sensitivity=args.sensitivity)
+    print(f"IDS sensitivity: {args.sensitivity} "
+          f"(effective flood threshold {wd.effective_flood_n} frames; "
+          f"adaptive margin raises it automatically in noisy air)")
     known: set = set()
     st = None
     if args.db:
@@ -913,9 +1067,13 @@ def cmd_ids(args) -> int:
         print(f"warden baseline updated: {n} BSSIDs marked known-good in {args.db}")
     if alerts:
         from .display import print_rows
-        print_rows(f"IDS alerts ({len(alerts)})",
+        print_rows(f"IDS alerts ({len(alerts)}) — every alert carries "
+                   f"confidence + status; 'unconfirmed' means a single "
+                   f"indicator, corroborate before acting",
                    [("Time", "time"), ("Severity", "severity"), ("Kind", "kind"),
-                    ("BSSID", "bssid"), ("SSID", "ssid"), ("Detail", "detail")],
+                    ("BSSID", "bssid"), ("SSID", "ssid"), ("Conf", "confidence"),
+                    ("Status", "status"), ("Evidence", "evidence"),
+                    ("Detail", "detail")],
                    [a.to_row() for a in alerts])
     else:
         print("no anomalies detected in "
@@ -925,12 +1083,14 @@ def cmd_ids(args) -> int:
           f"{ {k: v for k, v in s['by_severity'].items()} }")
     if args.output and alerts:
         import csv as _csv
+        from .privacy import secure_file
         os.makedirs(args.output, exist_ok=True)
         path = os.path.join(args.output, "ids_alerts.csv")
         with open(path, "w", newline="", encoding="utf-8-sig") as fh:
             w = _csv.DictWriter(fh, fieldnames=list(alerts[0].to_row()))
             w.writeheader()
             w.writerows(a.to_row() for a in alerts)
+        secure_file(path)
         print(f"exported -> {path}")
     if st:
         st.close()
@@ -1008,6 +1168,69 @@ def cmd_frames(args) -> int:
     return 0
 
 
+def cmd_db(args) -> int:
+    """History-database maintenance: retention, anonymization, deletion."""
+    if not os.path.exists(args.db) and not args.report:
+        log.error("no database at %s", args.db)
+        return 2
+    st = Store(args.db) if os.path.exists(args.db) else None
+    try:
+        if args.report or not (args.prune_days or args.delete_mac or
+                               args.anonymize_db or args.purge or args.vacuum):
+            if st is None:
+                log.error("no database at %s - nothing to report", args.db)
+                return 2
+            rep = st.storage_report()
+            print_rows("Database storage report",
+                       [("Fact", "k"), ("Value", "v")],
+                       [{"k": "path", "v": rep.get("path")},
+                        {"k": "size", "v": f"{rep.get('bytes', 0)} bytes"},
+                        {"k": "mode", "v": rep.get("mode")},
+                        {"k": "world-readable",
+                         "v": rep.get("world_readable")},
+                        {"k": "retention", "v": rep.get("retention")},
+                        {"k": "privacy mode", "v": rep.get("privacy_mode")},
+                        {"k": "anonymized writes",
+                         "v": rep.get("anonymized_writes")},
+                        {"k": "device rows",
+                         "v": rep["tables"]["devices"]["rows"]},
+                        {"k": "observation rows",
+                         "v": rep["tables"]["observations"]["rows"]},
+                        {"k": "fix rows",
+                         "v": rep["tables"]["fixes"]["rows"]}])
+            if rep.get("world_readable"):
+                print("WARNING: database is readable by other users — "
+                      "it maps devices to places and times. Restrict it: "
+                      f"`chmod 600 {args.db}` (this tool creates 0600 by "
+                      f"default; it was loosened afterwards)")
+            return 0
+        if args.prune_days:
+            n = st.prune(args.prune_days)
+            print(f"pruned {n} row(s) older than {args.prune_days:g} days")
+        if args.delete_mac:
+            n = st.delete_device(args.delete_mac)
+            print(f"erased {n} row(s) for {args.delete_mac}")
+        if args.anonymize_db or args.purge:
+            if not args.yes:
+                log.warning("proceeding without --yes: --anonymize-db is "
+                            "IRREVERSIBLE and --purge deletes all history")
+            if args.anonymize_db:
+                n = st.anonymize_history()
+                print(f"anonymized {n} row(s) — MACs are now salted "
+                      f"pseudonyms, IPs/hostnames cleared (no undo)")
+            if args.purge:
+                n = st.purge_all()
+                print(f"purged {n} history row(s)")
+        if args.vacuum or args.prune_days or args.delete_mac or \
+                args.anonymize_db or args.purge:
+            st.vacuum()
+            print("vacuumed.")
+        return 0
+    finally:
+        if st is not None:
+            st.close()
+
+
 def cmd_interfaces(args) -> int:
     ifaces = survey.list_interfaces()
     print(f"platform      : {os_name()}")
@@ -1041,7 +1264,7 @@ def main(argv=None) -> int:
           "own": cmd_own, "record": cmd_record, "presence": cmd_presence,
           "locate": cmd_locate, "trail": cmd_trail, "capture": cmd_capture,
           "traffic": cmd_traffic, "ids": cmd_ids, "audit": cmd_audit,
-          "frames": cmd_frames}[args.cmd]
+          "frames": cmd_frames, "db": cmd_db}[args.cmd]
     try:
         return fn(args)
     except KeyboardInterrupt:

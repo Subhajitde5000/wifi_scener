@@ -20,16 +20,26 @@ AP_COLUMNS = [
     "wps", "security_score", "security_grade", "risks", "phy_modes",
     "max_rate_mbps", "beacon_interval_tu", "dtim_period", "country", "mesh",
     "beacons_seen", "data_packets", "connected_devices", "active_devices",
+    "confirmed_devices", "rf_only_devices", "census_confidence", "census_note",
+    "ap_confidence", "ap_confidence_note",
     "bss_load_sta_count", "channel_utilization_pct", "eapol_frames",
     "deauth_frames", "client_macs", "first_seen", "last_seen", "source",
 ]
 
 STA_COLUMNS = [
-    "scan_id", "mac", "vendor", "is_randomized", "associated_bssid",
+    "scan_id", "mac", "vendor", "is_randomized", "identity_class",
+    "associated_bssid",
     "associated_ssid", "ip_address", "hostname", "open_ports", "rssi_dbm",
     "rssi_min_dbm", "rssi_max_dbm", "signal_quality_pct",
     "estimated_distance_m", "channel", "packets", "data_packets",
-    "bytes_seen", "dwell_s", "probed_ssids", "state", "first_seen", "last_seen",
+    "bytes_seen", "dwell_s", "probed_ssids", "state",
+    "sources", "evidence", "binding_confidence", "confidence", "confirmed",
+    "identity_note", "first_seen", "last_seen",
+]
+
+ROGUE_COLUMNS = [
+    "ssid", "bssid_count", "bssids", "severity", "reasons",
+    "indicators", "indicator_count", "score", "confidence", "verdict",
 ]
 
 
@@ -83,18 +93,29 @@ def _sta_rows(engine: Engine, scan_id: str) -> List[dict]:
 
 
 def _write_csv(path: str, columns: List[str], rows: List[dict]) -> str:
+    from .privacy import secure_file
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
+    secure_file(path)  # exports contain device identities: owner-only
     log.info("wrote %-42s (%d rows)", path, len(rows))
     return path
 
 
 def export_all(engine: Engine, outdir: str = "output", prefix: str = "",
-               formats=("csv", "json"), scan_id: str = "") -> List[str]:
-    """Write every artefact and return the list of files created."""
+               formats=("csv", "json"), scan_id: str = "",
+               anonymize: bool = False, salt: str = "") -> List[str]:
+    """Write every artefact and return the list of files created.
+
+    ``anonymize=True`` pseudonymises client MACs (salted HMAC tokens) and
+    drops hostnames/IPs/probe lists from the exported files (weakness #3),
+    so reports can be shared without leaking device identities. A fresh
+    random salt is used per export unless one is passed, and the salt is
+    NEVER written to the export.
+    """
+    from .privacy import anonymize_hostname, hash_mac, new_salt, secure_file
     scan_id = scan_id or _ts()
     prefix = prefix or f"wifi-{scan_id}"
     os.makedirs(outdir, exist_ok=True)
@@ -106,6 +127,20 @@ def export_all(engine: Engine, outdir: str = "output", prefix: str = "",
     summary = engine.summary()
     congestion = engine.channel_congestion()
     rogues = engine.rogue_candidates()
+    if anonymize:
+        salt = salt or new_salt()
+        for r in sta_rows:
+            r["mac"] = hash_mac(r.get("mac", ""), salt)
+            r["ip_address"] = ""
+            r["hostname"] = anonymize_hostname(r.get("hostname", ""))
+            r["probed_ssids"] = ""
+        for r in ap_rows:
+            r["client_macs"] = "|".join(
+                hash_mac(m, salt) for m in str(r.get("client_macs", "") or "")
+                .split("|") if m)
+        summary["anonymized_export"] = True
+        summary["anonymization_note"] = ("client MACs are salted one-export "
+                                         "pseudonyms; unlinkable across exports")
 
     if "csv" in formats:
         written.append(_write_csv(f"{base}_networks.csv", AP_COLUMNS, ap_rows))
@@ -119,8 +154,7 @@ def export_all(engine: Engine, outdir: str = "output", prefix: str = "",
                 crows))
         if rogues:
             written.append(_write_csv(
-                f"{base}_rogue_alerts.csv",
-                ["ssid", "bssid_count", "bssids", "severity", "reasons"], rogues))
+                f"{base}_rogue_alerts.csv", ROGUE_COLUMNS, rogues))
         flat = [{"metric": k, "value": json.dumps(v) if isinstance(v, (dict, list)) else v}
                 for k, v in summary.items()]
         written.append(_write_csv(f"{base}_summary.csv", ["metric", "value"], flat))
@@ -139,6 +173,7 @@ def export_all(engine: Engine, outdir: str = "output", prefix: str = "",
         p = f"{base}.json"
         with open(p, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, default=str)
+        secure_file(p)
         log.info("wrote %-42s", p)
         written.append(p)
 

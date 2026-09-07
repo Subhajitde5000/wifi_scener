@@ -5,7 +5,7 @@ positioning · raw capture · cleartext-traffic audit · wireless IDS ·
 hardening reports · 802.11 frame anatomy — one terminal tool, everything in
 CSV/JSON/HTML.**
 
-Version 2.1.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
+Version 2.2.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
 dependencies · 100% receive-only.
 
 ```
@@ -245,7 +245,7 @@ python3 main.py frames tests/fixture.pcap --filter beacon
 
 | Module | Responsibility |
 |---|---|
-| `wifiscanner/models.py` | `AccessPoint`/`Station` dataclasses, RF math (channel↔freq, path-loss ranging, quality), security score/grade/risk rules |
+| `wifiscanner/models.py` | `AccessPoint`/`Station` dataclasses, RF math (channel↔freq, path-loss ranging, quality), security score/grade/risk rules, per-binding evidence + census breakdown |
 | `wifiscanner/oui.py` | OUI vendor DB, MAC normalisation, randomized + multicast detection |
 | `wifiscanner/backends/survey.py` | `iw`/`nmcli`/`iwlist`/`airport`/`system_profiler`/`netsh` parsers → AP objects |
 | `wifiscanner/backends/sniffer.py` | monitor-mode bring-up (`iw`/`airmon-ng`), passive 802.11 collector: full IE/RSN parsing, To-DS/From-DS attribution, channel hopping, streaming pcap writer (rotate + ring) |
@@ -268,7 +268,9 @@ Global flags: `-v/--verbose` (debug logs), `-q/--quiet`, `--no-banner`,
 `--version`. Shared scan-family flags (on `scan monitor full detail devices own
 watch offline`): `-i/--interface`, `-o/--output DIR`, `--prefix`,
 `--format {csv,json,html,md}…`, `--sort {rssi,clients,ssid,channel,security}`,
-`--limit N`, `--db SQLITE` (persist snapshot), `--sensor NAME` (tag rows).
+`--limit N`, `--db SQLITE` (persist snapshot), `--sensor NAME` (tag rows),
+`--retain-days N` (history retention, default 90), `--privacy-mode
+{standard,minimal,ephemeral}`, `--anonymize` (salted MAC pseudonyms in exports).
 (`locate` reuses a subset — `-i -d --airmon --no-monitor-setup --db` — plus its own
 grid flags; `record/presence/trail/capture/traffic/ids/audit/frames` are
 standalone and list their flags below.)
@@ -330,7 +332,12 @@ Streaming pcap writer (never buffers in RAM): `--rotate-mb 64` starts
 `--ring-segments 8` makes it a bounded ring (oldest segment overwritten —
 fixed disk budget for 24/7). `--analyze` parses into AP/client tables at
 exit. Ctrl-C finalises. Flags: `-i -d -c --bands --bssid --hop-interval -o
-FILE --rotate-mb --ring-segments --airmon --no-monitor-setup`.
+FILE --rotate-mb --ring-segments --airmon --no-monitor-setup`,
+plus the sensitivity guardrails: `--ack-sensitive` (acknowledges captures
+hold third-party data; without it you get a loud warning, never a refusal),
+`--strip-payloads` (128-byte snaplen: headers for counting/IDS, no payloads),
+`--max-age-days N` (delete expired segments on exit). Files are written
+owner-only (0600).
 
 ### `traffic [pcap] | --live -i IF` — cleartext dissection
 Parses only frames visible *without* decryption. Extracts: DNS queries/responses
@@ -339,7 +346,11 @@ Parses only frames visible *without* decryption. Extracts: DNS queries/responses
 `who-has`, DHCP hostnames; aggregates flows (packets/bytes/SYN notes).
 Detects **cleartext credentials** (`POST` bodies with password/pwd/token
 fields, `Authorization: Basic`) — flagged, **values never logged**. Any frame
-with the Protected/WEP bit is skipped and counted. Output: rich tables +
+with the Protected/WEP bit is skipped and counted.
+**Redaction is ON by default**: URL query strings/fragments stripped,
+User-Agents reduced to product tokens, hostnames truncated, credential
+patterns scrubbed. `--no-redact` disables it (explicit opt-out, warns loudly),
+`--anonymize-ips` masks IPs to /24 for shared reports. Output: rich tables +
 `traffic_events.csv` + `traffic_flows.csv` with `-o DIR` (`--prefix`).
 `--max-frames` (default 200 000), `--limit` rows shown, live mode `-d`.
 
@@ -353,6 +364,10 @@ connection*; with neither, it **refuses** (exit 2) rather than persisting
 bystander data. `--pcap FILE` = one-shot: import a capture's AP/client model
 into the DB and exit. Reaps `iw station dump` automatically when this box
 hosts the AP. Prints one status line per pass.
+Privacy: `--retain-days N` (default 90, auto-enforced on every open),
+`--privacy-mode {standard,minimal,ephemeral}`, `--anonymize` (salted MAC
+pseudonyms, no hostnames/IPs). See `db` for pruning, per-device erasure and
+whole-DB anonymization.
 
 ### `presence` — query the history
 `--db`, filters `--mac`, `--ssid`, `--since/-–until`, `--gap 300` (seconds of
@@ -378,7 +393,11 @@ zone, method). Without `--sensors` degrades to a presence-only trail
 ### `ids` — passive wireless IDS
 Live: `-i wlan0 -d 60` (root; monitor). Offline: `--pcap FILE`.
 Tuning: `--window 10.0` s anomaly window, `--flood 5` frames in window
-before “flood”. Warden: `--db warden.sqlite --learn` baselines currently
+before “flood”, `--sensitivity {low,medium,high}` (scales the threshold 2×/1×/0.6×).
+Every alert carries `confidence` 0-100 + `status` (unconfirmed/corroborated/confirmed)
++ `evidence` and a “to confirm” hint; beacon mutations must persist across beacons
+to upgrade, and an adaptive margin raises the bar automatically when the whole
+band is noisy. Warden: `--db warden.sqlite --learn` baselines currently
 visible APs; every beacon from a BSSID not in the baseline then raises
 `unknown-bss`. `--follow` prints alerts as they fire; `-o DIR` exports
 `ids_alerts.csv`. Detection only — see §13.
@@ -401,6 +420,13 @@ LLC/SNAP ethertype, EAPOL **role + flags decoded from bytes** (key
 material never rendered). `--handshakes` prints the census: total EAPOL,
 per-BSS EAPOL, deauth/disassoc totals — counts only.
 
+### `db` — history-database maintenance (privacy controls)
+`--report` (permissions/size/retention/table counts + world-readable warning),
+`--prune-days N` (delete old rows + vacuum), `--delete-mac AA:..` (erase one
+device everywhere, MAC or pseudonym), `--anonymize-db --yes` (**irreversible**:
+salted MAC pseudonyms, IPs/hostnames wiped), `--purge --yes` (delete all history,
+keep warden baseline), `--vacuum`. Destructive actions require `--yes`.
+
 ### `interfaces` — capability report
 platform, root?, backends found, scapy present?, OUI table size, and each
 wireless interface with mode / MAC / channel.
@@ -413,7 +439,10 @@ All files UTF-8 **with BOM** (opens correctly in Excel), RFC-4180 quoting,
 header row always present, filenames `wifi-<scanid>_*` (or your `--prefix`).
 Every row carries `scan_id` so repeated scans concatenate in pandas.
 
-### `<prefix>_networks.csv` — 43 columns, one row per BSS
+All exports are written owner-only (0600); pass `--anonymize` for salted,
+per-export, unlinkable MAC pseudonyms with hostnames/IPs/probes dropped.
+
+### `<prefix>_networks.csv` — 49 columns, one row per BSS
 
 | Column | Meaning |
 |---|---|
@@ -453,10 +482,10 @@ keeps `lan` rows), `first_seen`, `last_seen`.
 | `*_rogue_alerts.csv` | SSID, bssid_count, bssids, severity, reasons (§11.4) |
 | `*_summary.csv` | scan-level metrics (`metric,value`) |
 | `presence_sessions.csv` | `presence -o`: mac, bssid, ssid, first/last_seen, duration_s, sightings, avg/min/max_rssi |
-| `trail-<MAC>.csv` | ts, time, x, y, unc_m, zone, method |
-| `traffic_events.csv` | time, ts, src/dst_mac, src, dst, proto, summary, detail, alert |
+| `trail-<MAC>.csv` | ts, time, x, y, unc_m, error_radius_m, zone, zone_confidence, method, confidence, sensor_count, display |
+| `traffic_events.csv` | time, ts, src/dst_mac, src, dst, proto, summary, detail, alert (redacted by default) |
 | `traffic_flows.csv` | src, dst, proto, packets, bytes, bytes_h, first, last, notes |
-| `ids_alerts.csv` | time, severity, kind, bssid, ssid, src, dst, detail |
+| `ids_alerts.csv` | time, severity, kind, bssid, ssid, src, dst, confidence, confidence_label, status, evidence, detail |
 | `audit_report.md` | checkbox list per BSS: `[x]/[!]/[ ]` |
 | `<prefix>.json` | everything nested: `{scan_id, generated_at, summary, connection, networks[], devices[], channel_congestion{band:[]}, rogue_alerts[]}` |
 | `<prefix>.html` | standalone dark-theme dashboard: summary cards, rogue banner, AP table (signal bars, grade pills), device table, channel bars, recommended channels |
@@ -532,12 +561,17 @@ Clamped 0.1–2000 m for the survey column; `locate` ranges clamp 0.2–500 m.
 **Order-of-magnitude only** — walls/antenna gain move
 it; that's why `locate` reports per-fix uncertainty instead of hiding it.
 
-### 11.4 Rogue / evil-twin heuristics
-Per SSID with ≥2 BSSIDs: alert when vendors differ, security sets differ, or
-an OPEN BSS mirrors a protected SSID → severity `high` (open clone) else
-`medium`. Warden adds: any beacon whose BSSID isn't in `warden` table →
-`unknown-bss`; any beacon whose (channel, security-IE set) changed mid-run →
-`beacon-mutation`.
+### 11.4 Rogue / evil-twin scoring (multi-indicator)
+Per SSID with ≥2 BSSIDs, each independent indicator scores evidence —
+`open-clone` 45, `security-mismatch` 25, `vendor-mismatch` 20,
+`warden-unknown` 20, `pmf-mismatch` 15, `signal-anomaly` 10, `channel-anomaly` 10 —
+fused with noisy-OR into `score` 0-100. Verdict `likely-rogue` requires **≥2
+indicators AND score ≥ 40** (severity `high` for open clones, else `medium`);
+single-indicator groups are listed as `unconfirmed` (severity `low`) and never
+counted as rogue — extenders, mesh nodes and multi-vendor enterprise WLANs all
+produce single-indicator lookalikes. Warden adds: any beacon whose BSSID isn't in
+`warden` table → `unknown-bss`; any beacon whose (channel, security-IE set) changed
+mid-run → `beacon-mutation` (low confidence until the new fingerprint persists).
 
 ### 11.5 Audit checks (each = weakness → attack → fix)
 `WPA3 / PMF-required encryption` · `PMF (802.11w) protects management frames`
@@ -727,7 +761,7 @@ python3 tests/make_fixture.py         # builds tests/fixture.pcap (288 frames:
                                       # assoc+data+LLC/SNAP-EAPOL per client,
                                       # probe storms, a 9-frame deauth burst,
                                       # 5 BSS incl. an evil twin)
-python3 tests/test_wifiscanner.py     # 49 tests, no radio, no root
+python3 tests/test_wifiscanner.py     # 76 tests, no radio, no root
 ```
 
 Coverage: RF math round-trips; randomized/multicast MAC rules; OUI; score
@@ -744,7 +778,12 @@ unknown-BSS**; audit rows PASS/FAIL logic; **frames annotator on real bytes
 parse, credential alert with value redaction, ARP, SNI parser, protected
 skip+count, 802.11 LLC/SNAP reassembly**; ring-buffer rotation on disk; CLI
 smoke incl. `record` guardrail refusal and `traffic/ids/audit/frames/presence`
-end-to-end subprocess runs.
+end-to-end subprocess runs; **trust: binding ranks, noisy-OR fusion, RF-vs-
+confirmed census, identity ranges; rogue multi-indicator scoring + warden;
+privacy: salted pseudonyms, redaction helpers, 0600 files; store retention/
+erase/anonymize/ephemeral; IDS confidence + sensitivity + persistence +
+adaptive margin; locate confidence + zone-primary display; capture `--ack`
+refusal; `db` report/prune/destructive-guard; anonymized exports**.
 
 ---
 
@@ -801,6 +840,17 @@ merged, here or in forks.
 
 ## 20. Changelog
 
+* **v2.2.0** — trust & privacy hardening (the 10 fixes, §21): central
+  source+confidence trust model (`trust.py`); RF-observed vs router-confirmed
+  census with per-binding evidence ranks; rotating-MAC honesty (observed-MAC
+  ranges, never same/different-device claims); privacy modes
+  (standard/minimal/ephemeral), salted MAC pseudonyms, auto-enforced retention,
+  `db` maintenance (report/prune/erase/anonymize/purge/vacuum); zone-primary
+  location with confidence + withheld low-confidence coordinates; capture
+  acknowledgement (`--ack-sensitive`, warns-only), payload-stripping snaplen, 0600 secure storage
+  everywhere; traffic redaction ON by default; IDS confidence/status/evidence,
+  `--sensitivity`, beacon persistence, adaptive noisy-air margin; multi-indicator
+  rogue scoring (≥2 indicators to declare). **76 tests**.
 * **v2.1.0** — `ids` (7-detector passive watchdog + warden baseline),
   `audit` (weakness→attack→fix reports), `frames` (frame anatomy +
   handshake census); raw LLC/SNAP EAPOL detection; fixture rebuilt with
@@ -813,3 +863,38 @@ merged, here or in forks.
 * **v1.0.0** — passive survey (5 OS backends), monitor-mode client
   attribution, RSN/IE parsing, security grading, rogue detection,
   congestion analysis, CSV×5/JSON/HTML/MD export, rich/ASCII terminal UI.
+rk guardrails.
+* **v1.0.0** — passive survey (5 OS backends), monitor-mode client
+  attribution, RSN/IE parsing, security grading, rogue detection,
+  congestion analysis, CSV×5/JSON/HTML/MD export, rich/ASCII terminal UI.
+
+---
+
+## 21. Trust & privacy model
+
+v2.2.0 hardens the ten weaknesses below. The design principle throughout:
+**every result carries its source and its confidence, and every byte written
+to disk is minimised, permission-locked and retention-bounded.**
+
+| # | Weakness | Fix (where) |
+|---|---|---|
+| 1 | Client counts stated as fact | `census`: `N✓ router-confirmed + M~ RF-observed` + 0-100 confidence; per-binding evidence ranks (`assoc-table` 98 … `single-frame` 35); router table **correlated**, never double-counted (`models.py`, `engine.py`, `backends/sniffer.py`) |
+| 2 | Randomized MACs | `identity_report()`: observed-MAC ranges (min–max physical devices); `identity_note` disclaims **both** directions (distinct rotating addresses are neither distinct devices nor the same device); `oui.classify_mac()` (`models.py`, `engine.py`, `oui.py`) |
+| 3 | Long-term tracking | `--privacy-mode standard/minimal/ephemeral`, `--anonymize` (salted HMAC pseudonyms, no hostnames/IPs/probes), auto-enforced retention (default 90 d), anonymized exports (`privacy.py`, `store.py`, `export.py`, `cli.py`) |
+| 4 | Noisy location | Every fix: error radius + `confidence` + `zone_confidence`; **zone is the primary answer**; low-confidence coordinates withheld (`Fix.display`); RSSI-spread demotion (`locate.py`) |
+| 5 | Sensitive raw PCAP | `--ack-sensitive` acknowledgement (warns, never blocks), `--strip-payloads` 128-B header-only captures, `--max-age-days` retention, 0600 files (`cli.py`, `backends/sniffer.py`) |
+| 6 | Traffic-analysis exposure | Metadata-minimal + **redaction ON by default** (URL queries stripped, UA→product token, hostnames truncated, credential patterns scrubbed, values never logged); `--anonymize-ips` for shared reports (`traffic.py`, `privacy.py`) |
+| 7 | IDS false positives | Per-alert `confidence`/`status`/`evidence` + “to confirm” hints, `--sensitivity`, beacon persistence (single sighting = 45, persisted = 78), adaptive noisy-air margin, cross-alert corroboration (`defense.py`) |
+| 8 | Ambiguous rogue APs | Noisy-OR scoring over 7 independent indicators; `likely-rogue` needs **≥2 indicators and score ≥ 40**; single-indicator groups listed as `unconfirmed`/`low` and never counted (`engine.py`) |
+| 9 | No trust model | `trust.py`: canonical sources with base reliability, ranked binding evidence, noisy-OR fusion (never reaches 100), high/medium/low/very-low labels — surfaced in terminal, CSV and JSON for stations, APs, alerts, rogues and fixes |
+| 10 | Sensitive history DB | 0600 at creation + world-readable warnings, `policy` table (salt/retention), `--retain-days` enforced on open, `db` command: `--report`, `--prune-days`, `--delete-mac`, `--anonymize-db --yes` (irreversible), `--purge --yes`, `--vacuum` (`store.py`, `cli.py`) |
+
+Operational notes:
+
+* Pair 0600 file permissions with full-disk encryption for captures/DBs at rest;
+  no new dependencies were added, so at-rest encryption stays an OS-layer concern.
+* Pseudonym salts live in each database's `policy` table and are **never**
+  written to exports; per-export salts make shared reports unlinkable.
+* `ephemeral` mode makes persistence calls raise instead of writing — use it for
+  live triage on airspace you must not retain data about.
+ain data about.
