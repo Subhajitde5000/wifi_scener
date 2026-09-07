@@ -14,6 +14,7 @@ from .display import (print_banner, print_congestion, print_detail,
 from .engine import Engine
 from .export import export_all
 from .locate import Tracker, ascii_map, load_sensors, load_zones
+from .defense import Watchdog, audit_ap, audit_engine
 from .oui import db_size, normalize
 from .store import Store, parse_when
 from .util import is_root, log, os_name, setup_logging
@@ -46,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
   wifiscanner capture -i wlan0 -d 3600 --ring-segments 8 --rotate-mb 64
   wifiscanner traffic capture.pcap -o out   dissect unencrypted frames
   wifiscanner offline capture.pcap          analyse an existing capture
+  wifiscanner ids -i wlan0 --pcap hour.pcap  passive IDS: deauth floods,
+                                              handshake-harvest signatures,
+                                              beacon mutations, rogue BSSIDs
+  wifiscanner audit                           hardening report for YOUR network
+  wifiscanner frames capture.pcap             802.11 frame-by-frame anatomy
+                                              (how all of this works)
   wifiscanner interfaces                    list wireless adapters
 """)
     p.add_argument("--version", action="version", version=f"wifiscanner {__version__}")
@@ -230,6 +237,39 @@ def build_parser() -> argparse.ArgumentParser:
     trf.add_argument("--prefix", default="traffic")
     trf.add_argument("--airmon", action="store_true")
     trf.add_argument("--no-monitor-setup", action="store_true")
+
+    ids = sub.add_parser("ids", help="passive wireless IDS: detect deauth "
+                       "floods, handshake-harvest attempts, beacon mutation, "
+                       "and unapproved BSSIDs. Detection only - it never "
+                       "attacks back, because that is not what defence needs.")
+    ids.add_argument("-i", "--interface", default="")
+    ids.add_argument("-d", "--duration", type=float, default=60.0)
+    ids.add_argument("--pcap", default="", help="analyse an existing capture instead")
+    ids.add_argument("--window", type=float, default=10.0, help="anomaly window (s)")
+    ids.add_argument("--flood", type=int, default=5, help="mgmt frames in window that count as flood")
+    ids.add_argument("--db", default="", help="warden baseline sqlite (learn/unknown BSSIDs)")
+    ids.add_argument("--learn", action="store_true", help="save current APs as known-good baseline")
+    ids.add_argument("--airmon", action="store_true")
+    ids.add_argument("--no-monitor-setup", action="store_true")
+    ids.add_argument("-o", "--output", default="", help="export alerts CSV here")
+    ids.add_argument("--follow", action="store_true", help="print alerts live as they fire")
+
+    aud = sub.add_parser("audit", help="defensive hardening audit of your own "
+                         "network: every weakness -> the attack it exposes -> "
+                         "the setting that defeats it")
+    aud.add_argument("--ssid", default="", help="audit only networks matching this")
+    aud.add_argument("--pcap", default="", help="audit from a capture file")
+    aud.add_argument("-i", "--interface", default="")
+    aud.add_argument("-o", "--output", default="", help="write markdown report here")
+
+    fr = sub.add_parser("frames", help="802.11 frame anatomy: annotated, "
+                        "educational dissection of every frame in a capture")
+    fr.add_argument("pcap")
+    fr.add_argument("--limit", type=int, default=20)
+    fr.add_argument("--filter", default="",
+                    help="beacon|probe-req|assoc-req|deauth|disassoc|data|handshake")
+    fr.add_argument("--handshakes", action="store_true",
+                    help="just summarise EAPOL/deauth activity (counts only)")
 
     sub.add_parser("interfaces", help="list wireless interfaces and capabilities")
     return p
@@ -808,6 +848,166 @@ def cmd_traffic(args) -> int:
     return 0
 
 
+# ------------------------------------------------- defense & education
+
+def cmd_ids(args) -> int:
+    wd = Watchdog(window_s=args.window, flood_frames=args.flood)
+    known: set = set()
+    st = None
+    if args.db:
+        st = Store(args.db)
+        known = {r["bssid"] for r in st.warden_list()}
+    wd.known = known or wd.known
+    fired = [0]
+
+    if args.pcap:
+        if not sniffer.scapy_available():
+            log.error("scapy required for pcap analysis")
+            return 2
+        from scapy.all import PcapReader
+        for pkt in PcapReader(args.pcap):
+            wd.feed(pkt)
+        log.info("analysed %s", args.pcap)
+    else:
+        if not sniffer.scapy_available():
+            log.error("scapy required for live IDS")
+            return 2
+        iface = args.interface
+        if not iface:
+            ifaces = survey.list_interfaces()
+            if not ifaces:
+                log.error("no wireless interface; use --pcap FILE instead")
+                return 2
+            iface = ifaces[0]["name"]
+        sn = sniffer.MonitorSniffer(iface, hop_interval=0.35)
+
+        def cb(pkt):
+            try:
+                wd.feed(pkt)
+            except Exception:
+                pass
+            if args.follow and len(wd.alerts) > fired[0]:
+                for a in wd.alerts[fired[0]:]:
+                    print(f"[{a.severity.upper():8}] {a.kind}: {a.detail}")
+                fired[0] = len(wd.alerts)
+        if args.no_monitor_setup:
+            sn.run(args.duration, on_packet=cb)
+        else:
+            if not is_root():
+                log.error("live IDS needs root (monitor mode), or --pcap FILE")
+                return 13
+            with sniffer.MonitorMode(iface, use_airmon=args.airmon) as mon:
+                sn.iface = mon
+                sn.run(args.duration, on_packet=cb)
+
+    alerts = wd.results()
+    if args.learn and st is not None:
+        eng = Engine()
+        if args.pcap and sniffer.scapy_available():
+            sn2 = sniffer.MonitorSniffer(iface="offline")
+            sn2.read_pcap(args.pcap)
+            eng.ingest(sn2.results())
+        else:
+            eng.ingest(survey.survey_networks(args.interface, "auto", False))
+        n = st.learn_warden(eng)
+        print(f"warden baseline updated: {n} BSSIDs marked known-good in {args.db}")
+    if alerts:
+        from .display import print_rows
+        print_rows(f"IDS alerts ({len(alerts)})",
+                   [("Time", "time"), ("Severity", "severity"), ("Kind", "kind"),
+                    ("BSSID", "bssid"), ("SSID", "ssid"), ("Detail", "detail")],
+                   [a.to_row() for a in alerts])
+    else:
+        print("no anomalies detected in "
+              f"{wd.stats()['frames']} frames ({wd.stats()['runtime_s'] or ''}s).")
+    s = wd.stats()
+    print(f"watchdog: {s['frames']} frames, {s['alerts']} alerts "
+          f"{ {k: v for k, v in s['by_severity'].items()} }")
+    if args.output and alerts:
+        import csv as _csv
+        os.makedirs(args.output, exist_ok=True)
+        path = os.path.join(args.output, "ids_alerts.csv")
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = _csv.DictWriter(fh, fieldnames=list(alerts[0].to_row()))
+            w.writeheader()
+            w.writerows(a.to_row() for a in alerts)
+        print(f"exported -> {path}")
+    if st:
+        st.close()
+    return 0
+
+
+def cmd_audit(args) -> int:
+    eng = Engine()
+    if args.pcap:
+        if not sniffer.scapy_available():
+            log.error("scapy required for pcap audit")
+            return 2
+        sn = sniffer.MonitorSniffer(iface="offline")
+        sn.read_pcap(args.pcap)
+        eng.ingest(sn.results())
+    else:
+        eng.ingest(survey.survey_networks(args.interface, "auto", True))
+    if args.ssid:
+        eng.aps = {b: a for b, a in eng.aps.items()
+                   if args.ssid.lower() in (a.ssid or "").lower()
+                   or args.ssid.upper() == b}
+    if not eng.aps:
+        log.error("no networks to audit (connected? or pass --pcap / --ssid)")
+        return 2
+    rows = audit_engine(eng)
+    from .display import print_rows
+    fails = [r for r in rows if r["status"] != "PASS"]
+    print_rows(f"Hardening audit - {len(eng.aps)} BSS, "
+               f"{len(fails)} findings",
+               [("BSSID", "bssid"), ("SSID", "ssid"), ("Check", "check"),
+                ("Status", "status"), ("Severity", "severity"),
+                ("Fix", "finding")], rows)
+    if args.output:
+        os.makedirs(args.output, exist_ok=True)
+        path = os.path.join(args.output, "audit_report.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("# Wi-Fi hardening audit\n\n")
+            for a in eng.sorted_aps("rssi"):
+                fh.write(f"\n## {a.ssid or '<hidden>'} ({a.bssid}, {a.vendor})\n\n")
+                fh.write(f"- Current: {a.encryption}, PMF {a.pmf or '?'}, "
+                         f"channel {a.channel}, WPS {'ENABLED' if a.wps else 'off'}\n")
+                for r in [x for x in rows if x["bssid"] == a.bssid]:
+                    mark = {"PASS": "[x]", "WARN": "[!]", "FAIL": "[ ]"}[r["status"]]
+                    fh.write(f" - {mark} **{r['check']}** "
+                             f"{'— ' + r['finding'] if r['finding'] else ''}\n")
+        print(f"report -> {path}")
+    return 0
+
+
+def cmd_frames(args) -> int:
+    if not sniffer.scapy_available():
+        log.error("scapy required:  pip install scapy")
+        return 2
+    if not os.path.exists(args.pcap):
+        log.error("no such file: %s", args.pcap)
+        return 2
+    from .frames import annotate_pcap, find_handshakes
+    if args.handshakes:
+        stats = find_handshakes(args.pcap)
+        print_rows("EAPOL / deauth activity (counts only - no frames are "
+                   "extracted, by design)",
+                   [("metric", "k"), ("value", "v")],
+                   [{"k": k, "v": v} for k, v in stats.items()
+                    if k != "eapol_by_bss"])
+        for b, c in (stats.get("eapol_by_bss") or {}).items():
+            print(f"  eapol @ {b}: {c}")
+        return 0
+    blocks = annotate_pcap(args.pcap, limit=args.limit, filt=args.filter)
+    if not blocks:
+        print("no frames matched (check --filter).")
+    for b in blocks:
+        print(b)
+    print(f"\n({len(blocks)} frames annotated"
+          + (f", filter={args.filter!r}" if args.filter else "") + ")")
+    return 0
+
+
 def cmd_interfaces(args) -> int:
     ifaces = survey.list_interfaces()
     print(f"platform      : {os_name()}")
@@ -840,7 +1040,8 @@ def main(argv=None) -> int:
           "offline": cmd_offline, "interfaces": cmd_interfaces,
           "own": cmd_own, "record": cmd_record, "presence": cmd_presence,
           "locate": cmd_locate, "trail": cmd_trail, "capture": cmd_capture,
-          "traffic": cmd_traffic}[args.cmd]
+          "traffic": cmd_traffic, "ids": cmd_ids, "audit": cmd_audit,
+          "frames": cmd_frames}[args.cmd]
     try:
         return fn(args)
     except KeyboardInterrupt:

@@ -275,6 +275,19 @@ class MonitorSniffer:
             ap.width_mhz = 20
 
     @staticmethod
+    def _raw_eapol(d) -> bool:
+        """EAPOL detection for captures scapy left as raw bytes."""
+        try:
+            raw = bytes(d.payload)
+        except Exception:
+            return False
+        if not raw:
+            return False
+        if raw[:3] == b"\xaa\xaa\x03":
+            raw = raw[8:]
+        return len(raw) >= 4 and raw[0] in (1, 2) and raw[1] == 3
+
+    @staticmethod
     def _parse_rsn(ap: AccessPoint, data: bytes, wpa1: bool = False) -> None:
         """Parse an RSN/WPA information element for ciphers, AKMs and PMF."""
         CIPHERS = {0: "GROUP", 1: "WEP40", 2: "TKIP", 4: "CCMP", 5: "WEP104",
@@ -397,7 +410,7 @@ class MonitorSniffer:
             return
 
         # ---- EAPOL: a 4-way handshake means a device just joined
-        if pkt.haslayer(EAPOL):
+        if pkt.haslayer(EAPOL) or self._raw_eapol(d):
             bssid = a3 or a1 or a2
             if bssid and relevant(bssid):
                 self.handshakes[bssid] = self.handshakes.get(bssid, 0) + 1

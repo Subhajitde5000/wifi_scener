@@ -199,7 +199,7 @@ def _write_html(path, scan_id, summary, ap_rows, sta_rows, congestion, rogues) -
              ("Rogue Alerts", summary["rogue_alerts"])]
     parts = [f"<!doctype html><meta charset=utf-8><title>Wi-Fi Survey {scan_id}</title>",
              f"<style>{_CSS}</style>",
-             f"<h1>Wi-Fi Intelligence Report</h1>",
+             "<h1>Wi-Fi Intelligence Report</h1>",
              f"<div class=sub>Scan <b>{esc(scan_id)}</b> &middot; {esc(summary['scan_started'])} "
              f"&middot; {esc(summary['duration_s'])}s</div>", "<div class=cards>"]
     for k, v in cards:

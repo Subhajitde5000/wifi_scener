@@ -690,6 +690,190 @@ def test_traffic_cli_on_pcap():
 
 
 
+# ------------------------------------------------------------ defense / IDS
+
+def _mgmt_frames():
+    from scapy.all import RadioTap, Dot11
+    from scapy.layers.dot11 import (Dot11Beacon, Dot11Elt, Dot11Deauth,
+                                    Dot11AssoReq)
+    ap, sta = "F0:9F:C2:11:22:34", "AC:BC:32:01:02:03"
+
+    def deauth():
+        return (RadioTap() / Dot11(type=0, subtype=12, addr1=sta,
+                                    addr2=ap, addr3=ap) / Dot11Deauth(reason=7))
+
+    def beacon(channel=6, rsn=True):
+        p = (RadioTap() / Dot11(type=0, subtype=8, addr1="ff:ff:ff:ff:ff:ff",
+                                addr2=ap, addr3=ap)
+             / Dot11Beacon(cap=0x1111 if rsn else 0x0001))
+        p /= Dot11Elt(ID=0, info=b"HomeFiber")
+        p /= Dot11Elt(ID=3, info=bytes([channel]))
+        if rsn:
+            p /= Dot11Elt(ID=48, info=bytes.fromhex(
+                "0100000fac040100000fac040100000fac020000"))
+        return p
+
+    def assoc():
+        return (RadioTap() / Dot11(type=0, subtype=0, addr1=ap, addr2=sta,
+                                    addr3=ap) / Dot11AssoReq()
+                / Dot11Elt(ID=0, info=b"HomeFiber"))
+
+    def eapol():
+        key = b"\x02\x03\x00\x5d\x02\x01\x8a\x00\x10" + b"\x00" * 80
+        return (RadioTap() / Dot11(type=2, subtype=8, FCfield=["to_DS"],
+                                   addr1=ap, addr2=sta, addr3=ap)
+                / (b"\xaa\xaa\x03\x00\x00\x00\x88\x8e" + key))
+    return ap, sta, deauth, beacon, assoc, eapol
+
+
+def test_watchdog_deauth_flood_threshold():
+    from wifiscanner.defense import Watchdog
+    ap, sta, deauth, beacon, assoc, eapol = _mgmt_frames()
+    wd = Watchdog(window_s=60, flood_frames=5, cooldown_s=0)
+    wd.known = {ap}
+    wd.feed(deauth())
+    wd.feed(deauth())
+    assert wd.alerts == [], "must not fire below threshold"
+    for _ in range(3):
+        wd.feed(deauth())
+    assert any(a.kind == "deauth-flood" and a.severity == "high"
+               for a in wd.alerts), wd.alerts
+
+
+def test_watchdog_forced_reauth_and_harvest_chain():
+    from wifiscanner.defense import Watchdog
+    ap, sta, deauth, beacon, assoc, eapol = _mgmt_frames()
+    wd = Watchdog(window_s=60, cooldown_s=0)
+    wd.known = {ap}
+    for _ in range(6):
+        wd.feed(deauth())                      # flood to kick the client
+    wd.feed(assoc())                           # victim rejoins
+    wd.feed(eapol())                           # handshake restarts -> harvest
+    kinds = {a.kind for a in wd.alerts}
+    assert "forced-reauth" in kinds, kinds
+    assert "handshake-harvest-signature" in kinds, kinds
+    sev = {a.kind: a.severity for a in wd.alerts}
+    assert sev["handshake-harvest-signature"] == "critical"
+
+
+def test_watchdog_beacon_mutation_and_warden():
+    from wifiscanner.defense import Watchdog
+    ap, sta, deauth, beacon, assoc, eapol = _mgmt_frames()
+    wd = Watchdog(cooldown_s=0, known_bssids={"DE:AD:BE:EF:00:01"})
+    wd.feed(beacon(channel=6))                 # baseline this AP
+    wd.feed(beacon(channel=11, rsn=False))     # suddenly different!
+    kinds = {a.kind for a in wd.alerts}
+    assert "beacon-mutation" in kinds, kinds
+    # and a brand-new BSSID not in the warden baseline:
+    from scapy.all import RadioTap, Dot11
+    from scapy.layers.dot11 import Dot11Beacon, Dot11Elt
+    rogue = (RadioTap() / Dot11(type=0, subtype=8, addr1="ff:ff:ff:ff:ff:ff",
+                                addr2="12:34:56:78:9A:BC",
+                                addr3="12:34:56:78:9A:BC")
+             / Dot11Beacon(cap=0x0001) / Dot11Elt(ID=0, info=b"HomeFiber"))
+    wd.feed(rogue)
+    assert any(a.kind == "unknown-bss" for a in wd.alerts)
+
+
+def test_audit_rows():
+    from wifiscanner.defense import audit_ap
+    from wifiscanner.models import AccessPoint
+    wpa3 = AccessPoint(bssid="AA:BB:CC:DD:EE:01", security=["WPA3"],
+                       ciphers=["CCMP"], pmf="required", auth_suites=["SAE"])
+    rows = {r["check"]: r["status"] for r in audit_ap(wpa3)}
+    assert rows["WPA3 / PMF-required encryption"] == "PASS"
+    assert rows["PMF (802.11w) protects management frames"] == "PASS"
+    legacy = AccessPoint(bssid="AA:BB:CC:DD:EE:02", security=["WPA2"],
+                         ciphers=["TKIP"], wps=True, pmf="disabled")
+    rows = {r["check"]: r for r in audit_ap(legacy)}
+    assert rows["No WPS"]["status"] == "FAIL"
+    assert rows["No WEP/TKIP/RC4 anywhere"]["status"] == "FAIL"
+    assert "PMF" in rows["PMF (802.11w) protects management frames"]["finding"]
+    openap = AccessPoint(bssid="AA:BB:CC:DD:EE:03", security=[])
+    assert any(r["check"] == "Authentication present" and r["status"] == "FAIL"
+               for r in audit_ap(openap))
+
+
+# ------------------------------------------------------------------ frames
+
+def test_frames_annotate_and_handshakes():
+    from wifiscanner.frames import annotate_pcap, find_handshakes, eapol_flags
+    blocks = annotate_pcap(FIXTURE, limit=3, filt="beacon")
+    assert blocks, "no beacon blocks"
+    joined = "\n".join(blocks)
+    assert "IE[ 48] RSN" in joined or "Beacon" in joined
+    assert "WPA3" not in joined          # 2.4G beacons only in first 3
+    hs = annotate_pcap(FIXTURE, limit=2, filt="deauth")
+    assert hs and "unplug over the air" in hs[0]
+    st = find_handshakes(FIXTURE)
+    assert st["deauth_disassoc"] == 9
+    assert st["eapol_total"] == 10
+    # eapol_flags on a raw frame
+    from scapy.all import RadioTap, Dot11
+    from scapy.packet import Raw
+    key = b"\x02\x03\x00\x5d\x02\x01\x8a\x00\x10" + b"\x00" * 80
+    pkt = (RadioTap() / Dot11(type=2, subtype=8, FCfield=["to_DS"],
+                              addr1="AA:BB:CC:DD:EE:FF",
+                              addr2="11:22:33:44:55:66",
+                              addr3="AA:BB:CC:DD:EE:FF")
+           / Raw(load=b"\xaa\xaa\x03\x00\x00\x00\x88\x8e" + key))
+    desc = eapol_flags(pkt)
+    assert "0x018a" in desc and "flags" in desc
+
+
+def test_store_warden():
+    from wifiscanner.store import Store
+    with tempfile.TemporaryDirectory() as td:
+        st = Store(os.path.join(td, "w.sqlite"))
+        eng = _synthetic_engine()
+        n = st.learn_warden(eng)
+        assert n == 3
+        assert st.unknown_bssids(eng) == []
+        from wifiscanner.models import AccessPoint
+        e2 = Engine()
+        e2.ingest([AccessPoint(bssid="12:34:56:78:9A:BC", ssid="NewEvil")])
+        assert st.unknown_bssids(e2) == ["12:34:56:78:9A:BC"]
+        assert len(st.warden_list()) == 3
+        st.close()
+
+
+def test_defense_cli_smoke():
+    root = os.path.dirname(HERE)
+    if not os.path.exists(FIXTURE):
+        subprocess.run([sys.executable, "tests/make_fixture.py"], cwd=root,
+                       check=True, capture_output=True)
+    env = dict(os.environ, COLUMNS="220")
+    with tempfile.TemporaryDirectory() as td:
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "ids", "--pcap", os.path.relpath(FIXTURE, root),
+                            "-o", td],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=180, env=env)
+        assert p.returncode == 0, p.stderr[:500]
+        assert "watchdog:" in p.stdout
+        # fixture contains a 9-frame deauth burst toward one AP
+        assert "deauth-flood" in p.stdout or "alerts 0" in p.stdout
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "audit", "--pcap", os.path.relpath(FIXTURE, root),
+                            "-o", td],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=180, env=env)
+        assert p.returncode == 0, p.stderr[:500]
+        assert os.path.exists(os.path.join(td, "audit_report.md"))
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "frames", os.path.relpath(FIXTURE, root),
+                            "--limit", "3", "--filter", "beacon"],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=180, env=env)
+        assert p.returncode == 0 and "IE[" in p.stdout
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "frames", os.path.relpath(FIXTURE, root),
+                            "--handshakes"],
+                           cwd=root, capture_output=True, text=True,
+                           timeout=180, env=env)
+        assert p.returncode == 0 and "eapol" in p.stdout.lower()
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

@@ -37,9 +37,12 @@ them is illegal in most jurisdictions and outside what this project is for):
 | Defeating MAC randomisation (de-anonymisation) | A privacy protection people chose; building a circumvention engine is surveillance tooling. |
 | Open-ended bystander tracking (mass MAC-history of every nearby device, correlating them across space/time) | The `record` command refuses to run unless it is pointed at *your own* network; probe-request sightings are never persisted. |
 
-Feature 10–14 and 7 from the wish-list fall in that table. Everything below is
-what ships instead — which still covers the entire *legitimate* half of the
-list, thoroughly.
+Reframing a request as "learning-only" or "own-network-only" does not change
+this: the same code that kicks your clients kicks anyone else's, so those
+primitives are not in this project at all. What ships instead is the complete
+**detection and education** counterpart — every declined attack has a frame-level
+signature, and `wifi_scener` now watches for, explains, and lets you learn all
+of them:
 
 ---
 
@@ -113,6 +116,9 @@ sudo python3 main.py capture -i wlan0 -d 3600 -o day.pcap \
 python3 main.py traffic day.pcap -o out/        # DNS/HTTP/SNI/ARP/DHCP events,
                                                 # flows, cleartext-credential
                                                 # alerts; protected frames skipped
+python3 main.py ids --pcap day.pcap             # did anyone try to kick/harvest?
+python3 main.py audit -o reports/               # weakness -> attack -> fix
+python3 main.py frames day.pcap --limit 30       # learn what each frame means
 sudo python3 main.py monitor -i wlan0 -d 120    # devices per AP, over the air
 python3 main.py offline day.pcap -o out/        # full analysis, no radio needed
 ```
@@ -177,6 +183,45 @@ credentials** in POST bodies / Basic-auth — the *values are flagged, never
 logged*. Frames with the 802.11 Protected bit are skipped and counted:
 **this module contains no decryption, by design.**
 
+### 15. `ids` — passive wireless IDS (the attack-signature engine)
+Stateful management-frame watchdog. Detection only — it never "fights back",
+because knowing the signature is what defence needs.
+```bash
+sudo python3 main.py ids -i wlan0 -d 3600 --db warden.sqlite   # live
+python3 main.py ids --pcap suspicious.pcap -o out/              # offline triage
+python3 main.py ids -i wlan0 --learn --db warden.sqlite        # baseline my APs
+```
+Signatures: **deauth/disassoc flood** (>N in window, per BSSID),
+**forced-reauth chain** — deauth→association within seconds (**critical**),
+**handshake-harvest signature** — the same chain ending in fresh EAPOL
+(**critical**: that is exactly what harvesting looks like from the victim
+side), **EAPOL storms**, **beacon fingerprint mutation** (channel/security IEs
+changing mid-air = reconfig or impersonation), **unknown BSSID** vs your warden
+baseline, with severity table + CSV export and `--follow` live tail.
+
+### 16. `audit` — hardening report that explains each attack and its countermeasure
+Every finding maps the weakness → the real attack it enables → the router
+setting that kills it (PMF-required defeats deauth floods; SAE defeats
+handshake harvesting; disabling WPS closes the PIN hole; dropping TKIP/RC4
+removes keystream-recovery targets…). Markdown checklist output with
+`-o`, works from a live scan or any capture.
+```bash
+python3 main.py audit -o reports/          # or: audit --pcap camp.pcap
+```
+
+### 17. `frames` — 802.11 frame anatomy, frame by frame
+The fastest way to actually *learn* Wi-Fi security. Annotates every frame in a
+capture: address-field semantics (why To-DS proves the client↔AP binding),
+IE-by-IE beacon decoding including RSN group/pairwise/AKM/PMF bits decoded from
+the real bytes, EAPOL **message roles and flags with key material deliberately
+not rendered**, LLC/SNAP handling, radiotap signal metadata, and the WPS/legacy-rate
+warnings inline.
+```bash
+python3 main.py frames capture.pcap --limit 50
+python3 main.py frames capture.pcap --filter deauth
+python3 main.py frames capture.pcap --handshakes     # EAPOL/deauth census (counts only)
+```
+
 ### Also in the core engine (unchanged, still the backbone)
 Full 802.11 IE parsing, security grading (WPA3/PMF/WPS/TKIP/OWE…), OUI vendor
 resolution, randomised-MAC detection, evil-twin/rogue detection, channel
@@ -199,6 +244,9 @@ survey backends, and `offline <pcap>` analysis with zero privileges.
 | `trail` | no | Per-device movement path, zone dwell, ASCII map |
 | `capture` | yes | Streaming pcap ring/rotation, raw 802.11 |
 | `traffic <pcap>` | no | Cleartext dissection (live mode needs root) |
+| `ids` | yes (live) / no (`--pcap`) | Passive IDS: flood/harvest/clone/rogue signatures + warden baseline |
+| `audit` | no | Weakness → attack → fix hardening report (MD checklist) |
+| `frames` | no | Annotated 802.11 frame anatomy for learning |
 | `detail <ssid>` | optional | A-to-Z dump of one network + clients |
 | `devices` | optional | Client list (with `--lan` for IPs/hostnames/ports) |
 | `full` | yes | scan + monitor + LAN + every export |
@@ -214,6 +262,8 @@ survey backends, and `offline <pcap>` analysis with zero privileges.
 | `*_devices.csv` | 23 columns per device: MAC/vendor/randomised/association/signal/traffic/probes/IP/hostname/ports |
 | `*_channels.csv` | Congestion per channel incl. 2.4 GHz overlap modelling |
 | `*_rogue_alerts.csv` | Evil-twin indicators |
+| `ids_alerts.csv` | Detection log with severities |
+| `audit_report.md` | Hardening checklist |
 | `*_summary.csv` | Scan-level metrics |
 | `presence_sessions.csv` | Queried history sessions |
 | `trail-<MAC>.csv` | Timed position fixes |
@@ -224,7 +274,7 @@ survey backends, and `offline <pcap>` analysis with zero privileges.
 
 ```bash
 python3 tests/make_fixture.py        # synthetic 802.11 pcap — no radio needed
-python3 tests/test_wifiscanner.py    # 42 tests
+python3 tests/test_wifiscanner.py    # 49 tests
 ```
 
 The suite covers RF maths, IE/RSN parsing, `iw`/`netsh` parsers, client
@@ -232,7 +282,10 @@ attribution against the fixture capture, security grading, rogue detection,
 CSV schema stability, **multilateration accuracy against a synthetic sensor
 grid (±1.2 m on ideal geometry)**, zone geometry, store sessions/gap-splitting
 and time parsing, the TLS-SNI parser, credential-alert redaction, ring-buffer
-capture files, protected-frame skipping, and CLI end-to-end runs.
+capture files, protected-frame skipping, **the IDS signature chain
+(deauth→reassoc→EAPOL fires `handshake-harvest-signature`), flood thresholds,
+beacon-mutation + warden detection, audit rows, frame annotator, and CLI
+end-to-end runs.**
 
 ## Platform & hardware
 

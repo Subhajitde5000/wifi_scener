@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS devices(
   ip TEXT, hostname TEXT, randomized INT, probed TEXT);
 CREATE TABLE IF NOT EXISTS observations(
   ts REAL, sensor TEXT, mac TEXT, bssid TEXT, rssi INT, freq INT);
+CREATE TABLE IF NOT EXISTS warden(
+  bssid TEXT PRIMARY KEY, ssid TEXT, meta TEXT,
+  first_seen REAL, last_seen REAL, seen INT);
 CREATE TABLE IF NOT EXISTS fixes(
   ts REAL, mac TEXT, x REAL, y REAL, unc REAL, method TEXT, sensors TEXT);
 CREATE INDEX IF NOT EXISTS idx_dev_mac  ON devices(mac, ts);
@@ -130,6 +133,35 @@ class Store:
                 "INSERT INTO devices VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", droles)
             self.db.executemany("INSERT INTO observations VALUES(?,?,?,?,?,?)", obs)
         return scan_id
+
+    # --------------------------------------------------------------- warden
+
+    def learn_warden(self, engine: Engine) -> int:
+        """Baseline the APs currently visible as 'known good'."""
+        ts = time.time()
+        n = 0
+        with self.db:
+            for bssid, a in engine.aps.items():
+                self.db.execute(
+                    "INSERT OR IGNORE INTO warden VALUES(?,?,?,?,?,0)",
+                    (bssid, a.ssid, f"ch{a.channel}|{a.encryption}", ts, ts))
+                self.db.execute(
+                    "UPDATE warden SET last_seen=?, seen=seen+1, ssid=?, meta=? "
+                    "WHERE bssid=?", (ts, a.ssid, f"ch{a.channel}|{a.encryption}",
+                                      bssid))
+                n += 1
+        return n
+
+    def unknown_bssids(self, engine: Engine) -> List[str]:
+        known = {r["bssid"] for r in self.db.execute("SELECT bssid FROM warden")}
+        if not known:
+            return []
+        return [b for b in engine.aps if b not in known]
+
+    def warden_list(self) -> List[dict]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT bssid, ssid, meta, first_seen, last_seen, seen "
+            "FROM warden ORDER BY last_seen DESC").fetchall()]
 
     def record_fixes(self, rows: List[tuple]) -> None:
         """rows: (ts, mac, x, y, unc, method, sensor_names)"""

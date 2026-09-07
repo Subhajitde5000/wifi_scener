@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from scapy.all import RadioTap, wrpcap
 from scapy.layers.dot11 import (Dot11, Dot11Beacon, Dot11Elt, Dot11AssoReq,
                                 Dot11ProbeReq, Dot11Deauth)
-from scapy.layers.eap import EAPOL
+from scapy.packet import Raw
 
 OUT = os.path.join(os.path.dirname(__file__), "fixture.pcap")
 
@@ -81,9 +81,10 @@ def main():
                             / Dot11(type=2, subtype=0, FCfield="from_DS",
                                     addr1=c, addr2=bssid, addr3=bssid)
                             / (b"\x00" * random.randint(60, 1400)))
-            pkts.append(RadioTap() / Dot11(type=2, subtype=0, FCfield="to_DS",
+            eapol_key = b"\x02\x03\x00\x5d\x02\x01\x8a\x00\x10" + b"\x00" * 80
+            pkts.append(RadioTap() / Dot11(type=2, subtype=8, FCfield="to_DS",
                                            addr1=bssid, addr2=c, addr3=bssid)
-                        / EAPOL(version=1, type=3))
+                        / Raw(load=b"\xaa\xaa\x03\x00\x00\x00\x88\x8e" + eapol_key))
 
     # unassociated devices probing for their known networks
     for mac, probes in (("F4:F5:E8:AA:11:22", ["HomeOffice", "Starbucks"]),
