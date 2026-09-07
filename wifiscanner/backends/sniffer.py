@@ -10,6 +10,7 @@ Requires: root + a card that supports monitor mode + scapy.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Callable, Dict, List, Optional
@@ -440,25 +441,59 @@ class MonitorSniffer:
 
     # -------------------------------------------------------------- control
 
-    def run(self, duration: float = 30.0, pcap_out: str = "") -> None:
-        """Sniff for `duration` seconds (blocking)."""
-        from scapy.all import sniff, wrpcap
+    def run(self, duration: float = 30.0, pcap_out: str = "",
+            ring_segments: int = 0, rotate_mb: float = 0.0,
+            on_packet: Optional[Callable] = None) -> None:
+        """Sniff for `duration` seconds (blocking).
+
+        pcap_out:   write a capture file (streamed, never buffered in RAM).
+        rotate_mb:  start a new file after N MB (forensic segmentation).
+        ring_segments: keep only the last N files, overwriting the oldest —
+                    a bounded, disk-safe ring buffer for 24/7 recording.
+        """
+        from scapy.all import sniff
         self.started_at = time.time()
         if len(self.channels) > 1:
             self._hopper = threading.Thread(target=self._hop, daemon=True)
             self._hopper.start()
-        captured = []
+
+        writer, seg, seg_bytes = None, 0, 0
+        base, ext = (os.path.splitext(pcap_out) if pcap_out else ("", ""))
+        ext = ext or ".pcap"
+        limit = int(rotate_mb * 1_000_000) if rotate_mb else 0
+
+        def seg_path(i: int) -> str:
+            return pcap_out if i == 0 else f"{base}-{i % max(ring_segments, 1):03d}{ext}" \
+                if ring_segments else f"{base}-{i:03d}{ext}"
+
+        if pcap_out:
+            from scapy.all import PcapWriter
+            writer = PcapWriter(seg_path(0), sync=True)
 
         def cb(pkt):
+            nonlocal seg, seg_bytes, writer
             try:
                 self._handle(pkt)
             except Exception as exc:
                 log.debug("frame error: %s", exc)
-            if pcap_out:
-                captured.append(pkt)
+            if on_packet:
+                try:
+                    on_packet(pkt)
+                except Exception:
+                    pass
+            if writer is not None:
+                writer.write(pkt)
+                seg_bytes += len(bytes(pkt))
+                if limit and seg_bytes >= limit:
+                    writer.close()
+                    seg += 1
+                    writer = PcapWriter(seg_path(seg), sync=True)  # ring: overwrites oldest
+                    log.info("rotated capture -> %s", seg_path(seg))
+                    seg_bytes = 0
 
-        log.info("sniffing on %s for %.0fs across %d channel(s)...",
-                 self.iface, duration, len(self.channels))
+        log.info("sniffing on %s for %.0fs across %d channel(s)%s...",
+                 self.iface, duration, len(self.channels),
+                 f" -> {pcap_out}" if pcap_out else "")
         try:
             sniff(iface=self.iface, prn=cb, store=False, timeout=duration,
                   monitor=True)
@@ -468,9 +503,12 @@ class MonitorSniffer:
             self._stop.set()
             if self._hopper:
                 self._hopper.join(timeout=2)
-        if pcap_out and captured:
-            wrpcap(pcap_out, captured)
-            log.info("wrote %d frames to %s", len(captured), pcap_out)
+            if writer is not None:
+                writer.close()
+                if seg:
+                    log.info("capture complete: segments %s-0..%d", base, seg)
+                else:
+                    log.info("wrote capture to %s", seg_path(0))
 
     def read_pcap(self, path: str) -> None:
         """Offline mode: analyse a previously captured pcap file."""

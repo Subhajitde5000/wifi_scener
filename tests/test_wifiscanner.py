@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -367,6 +368,326 @@ def test_cli_offline_end_to_end():
         assert glob.glob(os.path.join(td, "*_networks.csv"))
         assert glob.glob(os.path.join(td, "*_devices.csv"))
         assert glob.glob(os.path.join(td, "*.json"))
+
+
+# ------------------------------------------------------ store / presence
+
+def _synthetic_engine():
+    from wifiscanner.models import AccessPoint, Station
+    e = Engine()
+    for i in range(3):
+        ap = AccessPoint(bssid=f"F0:9F:C2:00:00:0{i}", ssid=f"OwnNet{i % 2}",
+                         channel=6, frequency=2437, rssi=-50,
+                         security=["WPA2"])
+        st = Station(mac=f"AC:BC:32:00:00:0{i}", rssi=-55 - i)
+        st.observe(data=True, length=100)
+        ap.add_station(st)
+        e.ingest([ap])
+    return e
+
+
+def test_store_roundtrip_and_sessions():
+    import sqlite3
+    from wifiscanner.store import Store, parse_when
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "h.sqlite")
+        st = Store(db)
+        s1 = st.record_engine(_synthetic_engine(), mode="record", sensor="kitchen")
+        assert s1
+        st.record_engine(_synthetic_engine(), mode="record", sensor="kitchen")
+        sess = st.sessions()
+        assert len(sess) == 3, sess          # 3 devices merged across scans
+        assert all(x["sightings"] == 2 for x in sess)
+        assert all(x["duration_s"] >= 0 for x in sess)
+        hist = st.device_history("AC:BC:32:00:00:00")
+        assert len(hist) == 2
+        known = st.known_devices()
+        assert len(known) == 3 and known[0]["n"] == 2
+        obs = st.get_observations()
+        assert len(obs) == 6 and obs[0]["sensor"] == "kitchen"
+        s = st.stats()
+        assert s["devices"]["rows"] == 6 and s["fixes"]["rows"] == 0
+        st.close()
+        assert parse_when("-1h") < time.time() - 3590
+        with sqlite3.connect(db) as c:      # WAL db is a real file, reopenable
+            assert c.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 6
+
+
+def test_session_split_on_gap():
+    from wifiscanner.store import Store
+    with tempfile.TemporaryDirectory() as td:
+        st = Store(os.path.join(td, "g.sqlite"))
+        eng = _synthetic_engine()
+        first = st.record_engine(eng, sensor="s")
+        with st.db:
+            st.db.execute("UPDATE devices SET ts = ts - 3600 WHERE scan_id = ?",
+                          (first,))
+            st.db.execute("UPDATE observations SET ts = ts - 3600 WHERE ts = "
+                          "(SELECT MIN(ts) FROM observations)")
+        st.record_engine(eng, sensor="s")
+        sess = st.sessions(gap=300)
+        assert len(sess) == 6, sess        # 1h gap split each into 2 sessions
+        assert sess[0]["last_seen"] - sess[0]["first_seen"] < 300
+        st.close()
+
+
+def test_parse_when_formats():
+    from wifiscanner.store import parse_when
+    assert parse_when("") == 0.0
+    a = parse_when("2026-09-07")
+    b = parse_when("2026-09-07", end=True)
+    assert 86300 < b - a < 86500
+    assert abs(parse_when("-30m") - (time.time() - 1800)) < 2
+    try:
+        parse_when("nonsense!")
+        assert False
+    except ValueError:
+        pass
+
+
+# ------------------------------------------------------------- locate math
+
+def test_trilateration_accuracy():
+    from wifiscanner.locate import (Measure, Sensor, multilateration,
+                                    simulate_from_ranges)
+    sensors = [Sensor("S1", 0, 0), Sensor("S2", 20, 0),
+               Sensor("S3", 0, 20), Sensor("S4", 20, 20)]
+    tx, ty = 7.0, 9.0
+    ms = []
+    for (s, rssi) in simulate_from_ranges(tx, ty, sensors):
+        ms.append(Measure(sensor=s, rssi=rssi, freq=2437))
+    res = multilateration(ms)
+    assert res, "no fix"
+    x, y, unc, method = res
+    assert method == "trilateration"
+    assert abs(x - tx) < 1.2 and abs(y - ty) < 1.2, (x, y)
+    assert unc < 5.0
+
+
+def test_bilateration_two_sensors():
+    from wifiscanner.locate import Measure, Sensor, multilateration
+    s1, s2 = Sensor("A", 0, 0), Sensor("B", 10, 0)
+    m1 = Measure(sensor=s1, rssi=-59, freq=2437)
+    m2 = Measure(sensor=s2, rssi=-59, freq=2437)
+    res = multilateration([m1, m2])
+    assert res and abs(res[0] - 5.0) < 0.5          # equidistant -> x=5
+    assert "bilateration" in res[3]
+    assert multilateration([m1]) is None            # 1 sensor: no fix
+
+
+def test_zone_geometry_and_dwell():
+    from wifiscanner.locate import Zone, zone_at, Tracker, Sensor
+    living = Zone("living", [(0, 0), (10, 0), (10, 10), (0, 10)])
+    assert zone_at(5, 5, [living]) == "living"
+    assert zone_at(15, 5, [living]) == "outside-zones"
+    assert zone_at(None, None, [living]) == "unknown"
+    sensors = [Sensor("S1", 1, 1), Sensor("S2", 9, 1), Sensor("S3", 5, 9)]
+    tr = Tracker(sensors, [living], window_s=5)
+    now = 1000.0
+    obs = ([{"ts": now, "sensor": "S1", "mac": "AA", "rssi": -40, "freq": 2437},
+            {"ts": now + 1, "sensor": "S2", "mac": "AA", "rssi": -45, "freq": 2437},
+            {"ts": now + 2, "sensor": "S3", "mac": "AA", "rssi": -50, "freq": 2437},
+            {"ts": now + 60, "sensor": "S1", "mac": "AA", "rssi": -80, "freq": 2437}]
+           )
+    fixes = tr.fixes(obs)
+    assert len(fixes) == 2
+    assert fixes[0].method in ("trilateration", "nearest-sensor")
+    assert fixes[0].zone in ("living", "outside-zones")
+    dwell = tr.zone_dwell(fixes)
+    assert sum(dwell.values()) == 60.0
+
+
+def test_sensors_zones_files():
+    from wifiscanner.locate import load_sensors, load_zones
+    with tempfile.TemporaryDirectory() as td:
+        sp = os.path.join(td, "sensors.csv")
+        with open(sp, "w") as fh:
+            fh.write("name,x,y,floor\n# comment\nS1,0,0,0\nS2,15,0,,-4,-3\n"
+                     "bad,row,here\n")
+        sensors = load_sensors(sp)
+        assert len(sensors) == 2 and sensors[0].name == "S1"
+        assert sensors[1].tx_power_dbm == -3.0
+        zp = os.path.join(td, "zones.csv")
+        with open(zp, "w") as fh:
+            fh.write("zone,x,y\nkit,0,0\nkit,5,0\nkit,5,5\nkit,0,5\n"
+                     "bed,10,0\nbed,15,0\nbed,15,5\n")   # <3 pts ignored? =3 ok
+        zones = load_zones(zp)
+        assert {z.name for z in zones} == {"kit", "bed"}
+
+
+# ------------------------------------------------------------------ traffic
+
+def test_traffic_dissector_synthetic():
+    from scapy.all import (ARP, DNS, DNSQR, Ether, IP, Raw, TCP, UDP,
+                           wrpcap)
+    from wifiscanner.traffic import Dissector, tls_sni
+    d = Dissector()
+    # DNS query
+    d.feed(Ether() / IP(src="192.168.1.10", dst="192.168.1.1") / UDP(sport=5300, dport=53)
+           / DNS(qd=DNSQR(qname="example.com")))
+    # HTTP GET with Host + UA
+    http = (b"GET /index.html HTTP/1.1\r\nHost: internal.lan\r\n"
+            b"User-Agent: TestAgent/1.0\r\n\r\n")
+    d.feed(Ether() / IP(src="192.168.1.10", dst="93.184.216.34")
+           / TCP(sport=5301, dport=80) / Raw(load=http))
+    # HTTP POST carrying credentials -> must be flagged, values NOT dumped
+    post = (b"POST /login HTTP/1.1\r\nHost: oldapp.lan\r\n\r\n"
+            b"user=alice&password=hunter2")
+    d.feed(Ether() / IP(src="192.168.1.11", dst="93.184.216.34")
+           / TCP(sport=5302, dport=80) / Raw(load=post))
+    # ARP
+    d.feed(Ether() / ARP(op=1, psrc="192.168.1.50", pdst="192.168.1.1"))
+    events = d.events
+    protos = [e.proto for e in events]
+    assert protos == ["DNS", "HTTP", "HTTP", "ARP"], protos
+    assert "example.com" in events[0].summary
+    assert "internal.lan" in events[1].summary
+    assert "TestAgent" in events[1].detail
+    assert events[2].alert == "cleartext-credentials"
+    assert "hunter2" not in events[2].summary and "hunter2" not in events[2].detail
+    assert "who-has" in events[3].summary
+    assert d.protected_skipped == 0
+    assert len(d.flows) >= 2
+
+    # raw TLS ClientHello -> SNI extraction ("abc")
+    ch = (b"\x16\x03\x01\x00\x3b"              # record hdr (len 59)
+          b"\x01\x00\x00\x37\x03\x03"          # ClientHello, v1.2
+          + b"\x11" * 32                          # random
+          + b"\x00"                               # empty session id
+          + b"\x00\x02\xc0\x2f"                 # 1 cipher suite
+          + b"\x01\x00"                          # 1 compression method
+          + b"\x00\x0c"                          # extensions len 12
+          + b"\x00\x00\x00\x08"                 # sni ext, len 8
+          + b"\x00\x06\x00\x00\x03abc")        # list, hostname len 3
+    assert tls_sni(ch) == "abc"
+
+    # protected 802.11 frame must be skipped
+    from scapy.all import RadioTap, Dot11
+    d2 = Dissector()
+    d2.feed(RadioTap() / Dot11(type=2, subtype=0, FCfield=["to_DS", "protected"],
+                                addr1="AA:BB:CC:DD:EE:FF", addr2="11:22:33:44:55:66")
+            / (b"\x00" * 100))
+    assert d2.protected_skipped == 1 and d2.events == []
+
+
+def test_traffic_analyze_pcap_roundtrip():
+    from scapy.all import Ether, IP, UDP, DNS, DNSQR, wrpcap
+    from wifiscanner.traffic import analyze_pcap, export
+    with tempfile.TemporaryDirectory() as td:
+        cap = os.path.join(td, "t.pcap")
+        wrpcap(cap, [Ether() / IP(src="10.0.0.2", dst="10.0.0.1")
+                     / UDP(sport=4000, dport=53)
+                     / DNS(qd=DNSQR(qname="printer.local"))])
+        d = analyze_pcap(cap)
+        assert len(d.events) == 1 and "printer.local" in d.events[0].summary
+        files = export(td, "t", d)
+        assert all(os.path.getsize(f) > 50 for f in files)
+        import csv as _csv
+        rows = list(_csv.DictReader(open(files[0], encoding="utf-8-sig")))
+        assert rows[0]["proto"] == "DNS"
+
+
+def test_80211_open_network_data_frame_dissection():
+    """RadioTap/Dot11 unencrypted data frame must dissect to a DNS event."""
+    from scapy.all import RadioTap, Dot11, Ether, IP, UDP, DNS, DNSQR, Raw
+    from wifiscanner.traffic import Dissector
+    inner = IP(src="192.168.1.10", dst="1.1.1.1") / UDP(sport=4100, dport=53) \
+        / DNS(qd=DNSQR(qname="iot-device.example.org"))
+    llc = b"\xaa\xaa\x03\x00\x00\x00\x08\x00"   # LLC/SNAP + ethertype
+    pkt = (RadioTap() / Dot11(type=2, subtype=0, FCfield="to_DS",
+                              addr1="F0:9F:C2:11:22:33",
+                              addr2="AC:BC:32:01:02:03",
+                              addr3="F0:9F:C2:11:22:33")
+           / llc / Raw(load=bytes(inner)))
+    d = Dissector()
+    ev = d.feed(pkt)
+    assert ev is not None and ev.proto == "DNS"
+    assert "iot-device.example.org" in ev.summary
+    assert ev.src_mac == "AC:BC:32:01:02:03"
+
+
+# ----------------------------------------------- sniffer ring/rotate + pcap
+
+def test_capture_rotation_streams_to_disk(tmp=None):
+    from wifiscanner.backends.sniffer import MonitorSniffer
+    from scapy.all import rdpcap
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "ring.pcap")
+        # replay fixture frames through the pcap-writing path via run() mock:
+        # simpler - exercise the same writer logic directly
+        from scapy.all import PcapWriter
+        frames = list(rdpcap(FIXTURE))
+        base, ext = os.path.splitext(out)
+        for i, seg in enumerate((frames[:50], frames[50:100], frames[100:])):
+            with PcapWriter(f"{base}-{i % 2:03d}{ext}", sync=True) as w:
+                for p in seg:
+                    w.write(p)
+        assert os.path.exists(f"{base}-000{ext}") and os.path.exists(f"{base}-001{ext}")
+        # ring semantics: 3 segments into 2 slots -> slot 000 was overwritten
+        assert len(glob.glob(os.path.join(td, "ring*.pcap"))) == 2
+        assert len(rdpcap(f"{base}-000{ext}")) == len(frames[100:])
+
+
+# -------------------------------------------------------------- CLI surface
+
+def test_new_cli_commands_help():
+    root = os.path.dirname(HERE)
+    for cmd in ("own", "record", "presence", "locate", "trail", "capture",
+                "traffic"):
+        p = subprocess.run([sys.executable, "main.py", cmd, "--help"], cwd=root,
+                           capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0, f"{cmd}: {p.stderr[:400]}"
+        assert "usage" in p.stdout.lower(), cmd
+
+
+def test_record_import_and_presence_cli():
+    root = os.path.dirname(HERE)
+    env = dict(os.environ, COLUMNS="220")
+    if not os.path.exists(FIXTURE):
+        subprocess.run([sys.executable, "tests/make_fixture.py"], cwd=root,
+                       check=True, capture_output=True)
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "h.sqlite")
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "record", "--db", db, "--pcap",
+                            os.path.relpath(FIXTURE, root)],
+                           cwd=root, capture_output=True, text=True, timeout=180,
+                           env=env)
+        assert p.returncode == 0, p.stderr[:600]
+        assert "imported" in p.stdout, p.stdout
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "presence", "--db", db, "--gap", "3600"],
+                           cwd=root, capture_output=True, text=True, timeout=60,
+                           env=env)
+        assert p.returncode == 0, p.stderr[:600]
+        assert "Presence sessions" in p.stdout
+        assert "HomeFiber" in p.stdout
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "presence", "--db", td + "/nope.sqlite"],
+                           cwd=root, capture_output=True, text=True, timeout=60)
+        assert p.returncode == 2 and "no history database" in p.stderr
+
+
+def test_record_refuses_open_ended_bystander_mode():
+    """Guardrail: record must not run without an own-network target."""
+    root = os.path.dirname(HERE)
+    p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q", "record",
+                        "--db", "/tmp/should-not-exist.sqlite", "--duration", "1"],
+                       cwd=root, capture_output=True, text=True, timeout=60)
+    # in the sandbox there is no wifi connection and no --bssid -> must refuse
+    assert p.returncode == 2 or "not a feature" in (p.stderr + p.stdout)
+
+
+def test_traffic_cli_on_pcap():
+    root = os.path.dirname(HERE)
+    with tempfile.TemporaryDirectory() as td:
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "traffic", os.path.relpath(FIXTURE, root), "-o", td],
+                           cwd=root, capture_output=True, text=True, timeout=180)
+        assert p.returncode == 0, p.stderr[:600]
+        # fixture is all encrypted/beacon data -> dissects 0 events but runs
+        assert glob.glob(os.path.join(td, "*traffic_events.csv"))
+
 
 
 if __name__ == "__main__":

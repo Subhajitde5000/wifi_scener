@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+import time
 import concurrent.futures as cf
 from typing import Dict, List, Optional
 
@@ -196,7 +197,68 @@ def _nmap_scan(subnet: str, do_ports: bool) -> List[Station]:
     return stations
 
 
+def own_ap_clients(iface: str = "") -> List[Station]:
+    """Authoritative client list straight from YOUR OWN access point.
+
+    If this machine hosts the AP (router / Pi with hostapd), the kernel soft
+    AP keeps the real association table, which is far better than anything
+    observable over the air: exact station list, bytes, signal, uptime.
+    Works only for an interface in AP mode — that is, your own network.
+    """
+    stations: List[Station] = []
+    ifaces = [iface] if iface else [i["name"] for i in _ap_interfaces()]
+    for ifn in ifaces:
+        rc, so, _ = run(["iw", "dev", ifn, "station", "dump"])
+        cur: Optional[Station] = None
+        for line in (so or "").splitlines():
+            m = re.match(r"Station (\S+) \(on (\S+)\)", line.strip())
+            if m:
+                if cur:
+                    stations.append(cur)
+                mac = normalize(m.group(1))
+                cur = Station(mac=mac, vendor=oui_lookup(mac),
+                              is_randomized=is_randomized(mac),
+                              bssid=normalize(_iface_mac(ifn) or ""),
+                              ssid=ifn)
+                continue
+            if cur is None:
+                continue
+            m = re.search(r"signal:\s*(-?\d+)\s*dBm", line)
+            if m:
+                cur.observe(int(m.group(1)))
+            m = re.search(r"(tx|rx) bytes:\s*(\d+)", line)
+            if m:
+                cur.bytes_seen += int(m.group(2))
+            m = re.search(r"connected time:\s*(\d+)", line)
+            if m:
+                cur.first_seen = time.time() - int(m.group(1))
+        if cur:
+            stations.append(cur)
+    if stations:
+        log.info("own-AP association table: %d clients", len(stations))
+    return stations
+
+
+def _ap_interfaces() -> List[dict]:
+    rc, so, _ = run(["iw", "dev"])
+    out, name = [], None
+    for line in so.splitlines():
+        m = re.search(r"^\s*Interface (\S+)$", line)
+        if m:
+            name = m.group(1)
+        elif name and re.search(r"type AP", line):
+            out.append({"name": name})
+    return out
+
+
+def _iface_mac(iface: str) -> str:
+    rc, so, _ = run(["ip", "link", "show", iface])
+    m = re.search(r"link/ether (\S+)", so)
+    return m.group(1) if m else ""
+
+
 def current_connection() -> dict:
+
     """Details about the Wi-Fi network this host is currently joined to."""
     info: dict = {}
     osn = os_name()

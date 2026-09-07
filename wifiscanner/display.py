@@ -215,6 +215,56 @@ def print_summary(engine: Engine) -> None:
         print(body)
 
 
+def print_rows(title: str, columns, rows, fmt=None) -> None:
+    """Generic table renderer used by the history/locate/traffic commands.
+
+    columns: list of (header, key) tuples; rows: list of dicts.
+    """
+    fmt = fmt or {}
+    if not _RICH:
+        widths = []
+        cells = []
+        for hdr, key in columns:
+            vals = []
+            for r in rows:
+                v = r.get(key, "") if isinstance(r, dict) else getattr(r, key, "")
+                if key in fmt and v not in ("", None):
+                    try:
+                        v = fmt[key](v)
+                    except Exception:
+                        pass
+                vals.append(str(v) if v not in ("", None) else "-")
+            w = max([len(hdr)] + [len(v) for v in vals]) if vals else len(hdr)
+            widths.append(min(w, 34))
+            cells.append(vals)
+        print(f"\n{title}")
+        print("  " + "  ".join(h[:w].ljust(w)
+                               for (h, _), w in zip(columns, widths)))
+        for i in range(len(rows)):
+            print("  " + "  ".join(c[i][:w].ljust(w)
+                                   for c, w in zip(cells, widths)))
+        if not rows:
+            print("  (no rows)")
+        return
+    from rich import box
+    t = Table(title=title, box=box.ROUNDED, header_style="bold blue",
+              expand=False)
+    for hdr, _ in columns:
+        t.add_column(hdr, max_width=44)
+    for r in rows:
+        vals = []
+        for _, key in columns:
+            v = r.get(key, "") if isinstance(r, dict) else getattr(r, key, "")
+            if key in fmt and v not in ("", None):
+                try:
+                    v = fmt[key](v)
+                except Exception:
+                    pass
+            vals.append(str(v) if v not in ("", None) else "[dim]-[/]")
+        t.add_row(*vals)
+    console.print(t)
+
+
 def print_congestion(engine: Engine) -> None:
     cong = engine.channel_congestion()
     if not cong:
