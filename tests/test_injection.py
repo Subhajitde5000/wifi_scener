@@ -42,10 +42,52 @@ def test_deauth_frame_addrs_and_reason():
     from scapy.all import Dot11
     from scapy.layers.dot11 import Dot11Deauth
     d = pkt.getlayer(Dot11)
-    assert d.type == 0 and d.subtype == 12
+    assert d.type == 0 and d.subtype == ij.SUBTYPE_DEAUTH == 12
     assert ij.normalize(d.addr1) == "AC:BC:32:01:02:03"   # unicast victim only
     assert ij.normalize(d.addr2) == "AA:BB:CC:DD:EE:FF"
     assert pkt.getlayer(Dot11Deauth).reason == ij.DEAUTH_REASON
+
+
+def test_disassoc_frame_is_subtype_10():
+    from scapy.all import Dot11
+    from scapy.layers.dot11 import Dot11Disas
+    pkt = ij.build_disassoc("AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03")
+    d = pkt.getlayer(Dot11)
+    assert d.type == 0 and d.subtype == ij.SUBTYPE_DISASSOC == 10
+    assert pkt.getlayer(Dot11Disas).reason == ij.DISASOC_REASON
+    assert ij.normalize(d.addr1) == "AC:BC:32:01:02:03"
+    # sta-to-ap direction flips the addresses
+    pkt2 = ij.build_disassoc("AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03",
+                             direction="sta-to-ap")
+    d2 = pkt2.getlayer(Dot11)
+    assert ij.normalize(d2.addr1) == "AA:BB:CC:DD:EE:FF"
+    assert ij.normalize(d2.addr2) == "AC:BC:32:01:02:03"
+
+
+def test_frame_summary_names_disassoc_and_deauth():
+    da = ij.frame_summary(ij.build_deauth("AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03"))
+    di = ij.frame_summary(ij.build_disassoc("AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03"))
+    assert da.startswith("deauth") and di.startswith("disassoc")
+
+
+def test_kick_burst_alternates_both_types():
+    with tempfile.TemporaryDirectory() as td:
+        audit = ij.AuditLog(os.path.join(td, "a.csv"))
+        inj = ij.Injector("wlan0", mode="deauth", dry_run=True, audit=audit)
+        inj.kick_burst("AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03", 4,
+                       frame_type="both", direction="ap-to-sta")
+        frames = [r["frame"] for r in audit.rows]
+        assert frames == ["deauth", "disassoc", "deauth", "disassoc"]
+        assert inj.sent == 0 and inj.built == 4
+        audit.close()
+
+
+def test_deauth_count_hard_capped():
+    # deauth mode allows a larger one-shot test burst than the tiny pmf-test
+    # probe, but is still hard-capped so a single run can never be a DoS.
+    assert ij.clamp_count("deauth", 9999) == ij.MAX_KICK_BURST
+    assert ij.clamp_count("deauth", 9999) <= 60
+    assert ij.clamp_count("pmf-test", 9999) == ij.MAX_DEAUTH_BURST == 4
 
 
 def test_random_local_mac_is_unicast_and_locally_administered():
@@ -182,6 +224,27 @@ def test_pmf_verdict_fail_when_client_reassociates():
     assert "PMF" in rep["detail"]
 
 
+def test_kick_verdict_counts_disassoc_as_kick():
+    ap, cli = "AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03"
+    # a disassociation-only burst that still kicks the client
+    events = [_ev("data", cli, ap, ap, 10.0),
+              _ev("disassoc", ap, cli, ap, 12.0),
+              _ev("assoc", cli, ap, ap, 13.0)]
+    rep = ij.kick_verdict(events, ap, cli, burst_ts=12.0)
+    assert rep["verdict"] == "fail"
+    assert rep["disassocs_observed"] >= 1 and rep["deauths_observed"] == 0
+    assert rep["kicks_observed"] == rep["disassocs_observed"]
+
+
+def test_kick_verdict_pass_on_disassoc_when_client_stays():
+    ap, cli = "AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03"
+    events = [_ev("data", cli, ap, ap, 10.0),
+              _ev("disassoc", ap, cli, ap, 12.0),
+              _ev("data", cli, ap, ap, 13.0)]
+    rep = ij.kick_verdict(events, ap, cli, burst_ts=12.0)
+    assert rep["verdict"] == "pass" and rep["pmf_protected"] is True
+
+
 def test_pmf_verdict_inconclusive_when_idle():
     ap, cli = "AA:BB:CC:DD:EE:FF", "AC:BC:32:01:02:03"
     rep = ij.pmf_verdict([], ap, cli, burst_ts=12.0)
@@ -205,11 +268,41 @@ def test_canary_results_matches_token_or_src():
 
 def test_ids_selftest_all_signatures_detected():
     rep = ij.run_ids_selftest()
-    assert rep["total"] == 4
-    assert rep["passed"] == 4, [(r["scenario"], r["missing"])
+    assert rep["total"] == 5              # deauth + disassoc + reauth + beacon + warden
+    assert rep["passed"] == 5, [(r["scenario"], r["missing"])
                                 for r in rep["rows"] if r["status"] != "PASS"]
     for r in rep["rows"]:
         assert r["status"] == "PASS" and r["missing"] == ""
+    assert any("disassociation" in r["scenario"] for r in rep["rows"])
+
+
+def test_ids_detects_disassoc_and_ignores_auth_subtype():
+    """Regression: disassoc is subtype 10, auth is 11 (not a kick)."""
+    from scapy.all import RadioTap, Dot11
+    from scapy.layers.dot11 import Dot11Disas, Dot11Auth
+    from wifiscanner.defense import Watchdog
+    ap, sta = "F0:9F:C2:11:22:34", "AC:BC:32:01:02:99"
+
+    def disas():
+        return (RadioTap() / Dot11(type=0, subtype=10, addr1=sta, addr2=ap,
+                                   addr3=ap) / Dot11Disas(reason=8))
+
+    def auth():
+        return (RadioTap() / Dot11(type=0, subtype=11, addr1=ap, addr2=sta,
+                                   addr3=ap) / Dot11Auth())
+
+    wd = Watchdog(window_s=60, flood_frames=5, cooldown_s=0,
+                  known_bssids={ap})
+    for _ in range(6):
+        wd.feed(disas())
+    assert any(a.kind == "deauth-flood" for a in wd.alerts), \
+        "disassociation flood must be detected"
+
+    wd2 = Watchdog(window_s=60, flood_frames=5, cooldown_s=0)
+    for _ in range(30):
+        wd2.feed(auth())     # subtype 11 = authentication, NOT a kick
+    assert not any(a.kind == "deauth-flood" for a in wd2.alerts), \
+        "authentication frames must not be miscounted as deauths"
 
 
 def test_ids_selftest_writes_pcap_capable_of_feeding_ids():
@@ -249,7 +342,7 @@ def test_cli_ids_selftest_exit_zero_and_runs():
                             "inject", "--mode", "ids-selftest", "-o", td],
                            cwd=root, capture_output=True, text=True, timeout=120)
         assert p.returncode == 0, p.stderr
-        assert "4/4" in p.stdout and "PASS" in p.stdout
+        assert "5/5" in p.stdout and "PASS" in p.stdout
         assert os.path.exists(os.path.join(td, "ids_selftest.pcap"))
 
 
@@ -299,6 +392,46 @@ def test_cli_pmf_requires_yes_even_when_authorized():
     # non-root box: consent check for --yes must fire before/independently
     assert p.returncode == 2
     assert "--yes" in (p.stderr + p.stdout) or "root" in (p.stderr + p.stdout)
+
+
+def test_cli_deauth_dry_run_alternates_frames_and_transmits_nothing():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with tempfile.TemporaryDirectory() as td:
+        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                            "inject", "--mode", "deauth", "-i", "wlan0", "-c",
+                            "6", "--frame-type", "both", "--bssid",
+                            "AA:BB:CC:DD:EE:FF", "--client",
+                            "AC:BC:32:01:02:03", "--count", "4", "-o", td],
+                           cwd=root, capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0, p.stderr
+        assert "DRY RUN" in p.stdout and "transmitted: 0" in p.stdout
+        import csv as _csv
+        with open(os.path.join(td, "injection_audit.csv"),
+                  encoding="utf-8-sig") as fh:
+            rows = list(_csv.DictReader(fh))
+        frames = [r["frame"] for r in rows]
+        assert frames == ["deauth", "disassoc", "deauth", "disassoc"]
+        assert all(r["tx"] == "0" and r["dry_run"] == "1" for r in rows)
+        assert not os.path.exists(os.path.join(td, "deauth.pcap"))
+
+
+def test_cli_deauth_requires_yes_and_refuses_broadcast():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # missing --yes
+    p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                        "inject", "--mode", "deauth", "-i", "wlan0",
+                        "--bssid", "AA:BB:CC:DD:EE:FF",
+                        "--client", "AC:BC:32:01:02:03",
+                        "--transmit", "--authorized", "-o", "/tmp/inj-da1"],
+                       cwd=root, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2 and "--yes" in (p.stderr + p.stdout)
+    # broadcast client
+    p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+                        "inject", "--mode", "deauth", "-i", "wlan0",
+                        "--bssid", "AA:BB:CC:DD:EE:FF",
+                        "--client", "FF:FF:FF:FF:FF:FF", "-o", "/tmp/inj-da2"],
+                       cwd=root, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2 and "broadcast" in (p.stderr + p.stdout).lower()
 
 
 if __name__ == "__main__":

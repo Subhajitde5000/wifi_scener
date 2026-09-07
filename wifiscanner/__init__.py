@@ -1,6 +1,6 @@
 """wifiscanner - advanced passive Wi-Fi survey & client-attribution engine."""
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 from .models import AccessPoint, Station
 from .engine import Engine

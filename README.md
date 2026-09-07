@@ -5,7 +5,7 @@ positioning · raw capture · cleartext-traffic audit · wireless IDS ·
 hardening reports · 802.11 frame anatomy — one terminal tool, everything in
 CSV/JSON/HTML.**
 
-Version 2.3.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
+Version 2.4.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
 dependencies · receive-only except for one consent-gated defensive self-test.
 
 ```
@@ -53,13 +53,18 @@ Every survey, IDS, audit and history feature is receive-only: it never joins
 a network, clones an AP, cracks a key or decrypts anything.
 
 There is exactly **one** transmitting command, `inject`, and it is not an
-attack tool — it is a *self-test rig for your own defences*. It answers two
+attack tool — it is a *self-test rig for your own defences*. It answers the
 questions passive listening cannot: *"do my IDS sensors actually hear the
-channels they claim to?"* (canary markers) and *"does enabling PMF/802.11w on
-my router really stop deauth kicks?"* (a bounded, unicast, own-AP test). It
-is a dry run by default, requires root plus an explicit `--authorized`
-assertion (`--yes` for the deauth test), is hard rate-capped below the IDS
-flood threshold, refuses broadcast or third-party targets, and writes an
+channels they claim to?"* (canary markers); *"does enabling PMF/802.11w on my
+router really stop deauth kicks?"* (the bounded `pmf-test`); and, as an
+explicit authorised pen-test action, *"can a deauthentication /
+disassociation burst knock one of my own clients off?"* (the bounded, unicast
+`deauth` test, which sends real disconnect frames and reports whether the
+client was protected). It is a dry run by default, requires root plus an
+explicit `--authorized` assertion (`--yes` for any frame that disconnects a
+client), is hard rate-capped per run (the small PMF probe stays below the IDS
+flood threshold; the explicit deauth test is a one-shot, bounded burst —
+never a loop), refuses broadcast/wildcard/third-party targets, and writes an
 owner-only audit record of every frame. `ids-selftest` mode synthesises the
 attack signatures **offline, with no radio at all** and is safe in CI.
 
@@ -69,11 +74,11 @@ kit. These capabilities are **deliberately absent by design**:
 | Not in this tool | What ships instead |
 |---|---|
 | Decrypt WPA/WPA2/WPA3 traffic | Protected frames are skipped and *counted*; `traffic` proves what leaks *without* encryption so you can fix it |
-| Deauth/disassoc **floods** or broadcast kicking | `ids` detects deauth floods live; `inject --mode pmf-test` sends only a *handful* of unicast frames at **your own** client to prove PMF works |
+| Deauth/disassoc **floods**, broadcast/wildcard kicking, loops | `ids` detects deauth *and* disassociation floods live; `inject` sends only a bounded, one-shot, **unicast** burst at a device you name — either a tiny below-threshold PMF probe (`pmf-test`) or an explicit authorised pen-test burst (`deauth`, hard-capped, `--yes` required) |
 | Rogue/evil-twin AP creation | `ids` + `scan` detect rogue BSSIDs and cloned SSIDs |
 | Handshake capture for cracking | `ids` fires a **critical** alert when someone harvests handshakes against you; `frames --handshakes` explains the protocol |
-| Unrestricted packet injection / frame replay | The only transmit path (`inject`) is consent-gated, rate-capped, target-restricted to your own infrastructure, fully audited, and offers nothing but canary markers, ordinary active-scan probes and the bounded PMF self-test |
-| Jamming / channel flooding | Hard per-mode frame caps and a minimum inter-frame interval; the test burst is deliberately smaller than what `ids` calls a flood |
+| Unrestricted packet injection / frame replay | The only transmit path (`inject`) is consent-gated, target-restricted to your own infrastructure, fully audited, and offers nothing but canary markers, ordinary active-scan probes and bounded, logged, unicast deauth/disassoc self-tests |
+| Jamming / continuous channel flooding | Hard per-mode frame caps and a minimum inter-frame interval; every transmission is one bounded run, never a loop — sustained denial-of-service is not expressible in the CLI |
 | De-anonymising randomized MACs | Randomised addresses are *flagged* for reporting honesty, never correlated back to people |
 | Indefinite bystander tracking | `record` refuses to run unless pointed at your own network; probe sightings stay ephemeral |
 
@@ -104,7 +109,7 @@ how to close it) and `ids` (what each attack *looks like* on the wire).
 | 15 | LAN inventory (IPs, hostnames, ports, nmap integration) | `own`, `devices --lan` | no | no |
 | 16 | Live dashboard | `watch` | no | optional |
 | 17 | Structured export: 5 CSVs + JSON + HTML + Markdown | `-o --format` everywhere | no | no |
-| 18 | **Authorized** packet injection: offline IDS signature self-test, active probe scan, IDS coverage canaries, bounded own-AP PMF/deauth check | `inject` | no (selftest) / yes (live) | yes (live only) |
+| 18 | **Authorized** packet injection: offline IDS signature self-test (incl. disassoc-flood), active probe scan, IDS coverage canaries, bounded own-AP PMF check, bounded unicast **deauthentication/disassociation** test | `inject` | no (selftest) / yes (live) | yes (live only) |
 
 ---
 
@@ -271,7 +276,7 @@ python3 main.py frames tests/fixture.pcap --filter beacon
 | `wifiscanner/traffic.py` | cleartext dissector (DNS/HTTP/TLS-SNI/ARP/DHCP), flows, credential alerts (redacted) |
 | `wifiscanner/defense.py` | IDS Watchdog (7 detectors), hardening `audit_ap` |
 | `wifiscanner/frames.py` | frame-by-frame annotated 802.11 anatomy |
-| `wifiscanner/inject.py` | the *only* transmitter: frame builders (probe/deauth), consent+privilege gates, hard frame caps, owner-only audit CSV, offline `run_ids_selftest`, PMF-verdict + canary analysis; dry run by default |
+| `wifiscanner/inject.py` | the *only* transmitter: frame builders (probe/deauth/**disassoc**, both directions), consent+privilege gates, hard frame caps, owner-only audit CSV, offline `run_ids_selftest` (deauth + disassoc signatures), kick/PMF verdict + canary analysis; dry run by default |
 | `wifiscanner/export.py` | CSV×5 / JSON / styled HTML / Markdown writers |
 | `wifiscanner/display.py` | rich tables/panels with full plain-text fallback |
 | `wifiscanner/cli.py` | argparse surface, 18 commands, guardrails |
@@ -450,15 +455,25 @@ implemented.
 
 | Mode | Purpose | Transmits? |
 |---|---|---|
-| `--mode ids-selftest` | synthesise deauth-flood / forced-reauth / beacon-mutation / unknown-BSS signatures **offline** and confirm the watchdog fires (also writes a pcap for `ids --pcap`) | never (no radio, no root) |
+| `--mode ids-selftest` | synthesise deauth-flood, **disassociation-flood**, forced-reauth, beacon-mutation and unknown-BSS signatures **offline** and confirm the watchdog fires (also writes a pcap for `ids --pcap`) | never (no radio, no root) |
 | `--mode probe` | ordinary active scanning — the same probe requests every OS sends while scanning; `--ssid` for a directed probe, otherwise wildcard | dry run / guarded live |
 | `--mode canary` | emit a distinctive probe-request marker (`--token`, auto-generated) so you can verify each remote IDS/capture sensor logs it (grep the token) | dry run / guarded live |
-| `--mode pmf-test` | send a tiny unicast deauth burst at **one of your own clients** (`--bssid` + `--client`), then report whether the client stayed (**PMF works**) or was kicked and re-associated (**PMF missing → fix it**) | requires root + `--transmit --authorized --yes` |
+| `--mode pmf-test` | send a tiny unicast deauth burst at **one of your own clients** (`--bssid` + `--client`), then report whether the client stayed (**PMF works**) or was kicked and re-associated (**PMF missing → fix it**). The burst is capped *below* the IDS flood threshold | requires root + `--transmit --authorized --yes` |
+| `--mode deauth` | explicit authorised pen-test of a client's resilience: a bounded, one-shot, **unicast** burst of deauthentication and/or disassociation frames. `--frame-type {deauth,disassoc,both}`, `--direction {ap-to-sta,sta-to-ap}`, `--count N` (hard-capped). Observes and reports whether the client disconnected/re-associated (**vulnerable to kick**) or ignored the frames (**protected**) | requires root + `--transmit --authorized --yes` |
+
+Every kick mode refuses broadcast/multicast or wildcard `--client`/`--bssid`
+(kicking *all* clients is an attack, not a test), never loops, and logs each
+frame with direction/reason to the 0600 audit CSV. Disassociation is the
+polite cousin of deauth (it asks an associated STA to drop the association);
+both are management frames protected by PMF/802.11w, so a client that stays
+associated has MFP correctly enforced.
 
 Typical use: `inject --mode ids-selftest` in CI; then on your own lab AP
 `sudo wifiscanner inject --mode pmf-test -i wlan0 -c 6 --bssid MY-AP-MAC
 --client MY-LAPTOP-MAC --transmit --authorized --yes` — exit 0 = PMF
-protected, 1 = client was kicked (fix 802.11w), 3 = inconclusive.
+protected, 1 = client was kicked (fix 802.11w), 3 = inconclusive. The same
+verdict applies to `--mode deauth --frame-type both`, which additionally
+exercises the full deauth/disassoc path at a configurable (capped) burst size.
 
 ### `db` — history-database maintenance (privacy controls)
 `--report` (permissions/size/retention/table counts + world-readable warning),
@@ -783,6 +798,14 @@ sudo wifiscanner inject --mode pmf-test -i wlan0mon -c 6 --no-monitor-setup \
      --transmit --authorized --yes
 # exit 0 = forged deauths were IGNORED (PMF works); 1 = client was kicked
 # (set Management Frame Protection to REQUIRED and re-test); 3 = inconclusive
+
+# 4) explicit authorised deauth/disassociation pen-test of YOUR own client:
+sudo wifiscanner inject --mode deauth -i wlan0mon -c 6 --no-monitor-setup \
+     --bssid AA:BB:CC:DD:EE:FF --client <your-test-laptop-MAC> \
+     --frame-type both --direction ap-to-sta --count 10 \
+     --transmit --authorized --yes
+# bounded one-shot unicast burst; reports "KICKED" (vulnerable -> enable
+# 802.11w) or "PASS" (frames ignored). Broadcast targets are refused.
 ```
 
 ---
@@ -826,7 +849,7 @@ python3 tests/make_fixture.py         # builds tests/fixture.pcap (288 frames:
                                       # 5 BSS incl. an evil twin)
 python3 tests/test_wifiscanner.py     # core suite, no radio, no root
 python3 tests/test_injection.py       # injection gates/builders/selftest
-# => 101 tests total, all offline; nothing transmits in the test suite
+# => 110 tests total, all offline; nothing transmits in the test suite
 ```
 
 Coverage: RF math round-trips; randomized/multicast MAC rules; OUI; score
@@ -853,8 +876,11 @@ refusal; `db` report/prune/destructive-guard; anonymized exports**; plus
 consent gate (root / --authorized / --yes) refusing the right way, broadcast-
 target rejection, hard frame caps, dry-run emits zero frames while writing
 the 0600 audit CSV, PMF pass/fail/inconclusive verdicts, canary matching, and
-the offline IDS self-test detecting all 4 signatures end-to-end through the
-CLI**.
+the offline IDS self-test detecting every signature end-to-end through the
+CLI; disassociation-frame subtypes, the deauth/disassoc burst mode, both
+directions, the one-shot kick cap, and a regression test that the IDS counts
+disassoc floods (subtype 10) while never miscounting authentication frames
+(subtype 11)**.
 
 ---
 
@@ -922,6 +948,19 @@ that feature is not getting merged, here or in forks.
 
 ## 20. Changelog
 
+* **v2.4.0** — full deauthentication/disassociation test + IDS subtype fix.
+  `inject --mode deauth` sends a bounded, one-shot, **unicast** burst of
+  deauth and/or disassociation frames (`--frame-type {deauth,disassoc,both}`,
+  `--direction {ap-to-sta,sta-to-ap}`) at one client you own, gated behind
+  root + `--transmit --authorized --yes`, hard-capped per run, and fully
+  audited; reports whether the client was disconnected (enable 802.11w) or
+  protected. **Fixed a real IDS bug:** disassociation frames are management
+  subtype **10** but the watchdog matched `(12, 11)` — so disassociation
+  floods were *missed* and authentication frames (subtype 11) were wrongly
+  counted; the association branch also matched probe requests (subtype 4)
+  instead of reassociations (subtype 2). Both now match the IEEE subtypes;
+  the offline self-test adds a disassociation-flood signature. Dry runs
+  remain the default and emit nothing. **110 tests**.
 * **v2.3.0** — authorized packet injection for defensive self-test
   (`inject.py` + `inject` command): offline zero-RF IDS signature self-test
   (`--mode ids-selftest`, CI-safe); ordinary active probe scan; IDS/sensor

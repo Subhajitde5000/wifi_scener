@@ -64,8 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
   wifiscanner inject --mode canary -i wlan0   dry run by default: preview the
       --channels 1,6,11                          probe markers, add --transmit
                                               --authorized to actually emit
-  wifiscanner inject --mode pmf-test -i wlan0 --channel 6 --bssid MY-AP \\
+  wifiscanner inject --mode pmf-test -i wlan0 -c 6 --bssid MY-AP \\
       --client MY-test-laptop --transmit --authorized --yes
+  wifiscanner inject --mode deauth -i wlan0 -c 6 --frame-type both \\
+      --bssid MY-AP --client MY-test-laptop --count 10 --transmit \\
+      --authorized --yes        # bounded, unicast, audited kick TEST
   wifiscanner interfaces                    list wireless adapters
 """)
     p.add_argument("--version", action="version", version=f"wifiscanner {__version__}")
@@ -322,28 +325,42 @@ def build_parser() -> argparse.ArgumentParser:
                     help="just summarise EAPOL/deauth activity (counts only)")
 
     inj = sub.add_parser("inject", help="AUTHORIZED transmission for defensive "
-                         "self-test only: IDS canaries, active probe scan, and a "
-                         "bounded own-AP PMF/deauth-resistance test. Dry run by "
-                         "default; needs root + --authorized (+--yes for deauth).")
+                         "self-test only: IDS canaries, active probe scan, a "
+                         "bounded own-AP PMF/deauth-resistance test, and an "
+                         "explicit unicast deauth/disassoc TEST. Dry run by "
+                         "default; needs root + --authorized (+--yes for kick "
+                         "modes). Broadcast/wildcard/third-party targets refused.")
     inj.add_argument("-i", "--interface", default="", help="wireless interface")
     inj.add_argument("--mode", default="probe",
-                     choices=["probe", "canary", "pmf-test", "ids-selftest"],
+                     choices=["probe", "canary", "pmf-test", "deauth",
+                              "ids-selftest"],
                      help="probe = active survey; canary = IDS/sensor coverage "
-                          "marker; pmf-test = verify YOUR AP enforces PMF; "
+                          "marker; pmf-test = small burst to verify YOUR AP "
+                          "enforces PMF; deauth = explicit bounded unicast "
+                          "deauth/disassoc TEST of YOUR own client (pen-test); "
                           "ids-selftest = offline, zero-RF IDS signature check")
     inj.add_argument("-c", "--channels", default="",
-                     help="comma list, e.g. 1,6,11 (pmf-test: the AP's channel)")
+                     help="comma list, e.g. 1,6,11 (kick modes: the AP channel)")
     inj.add_argument("--ssid", default="",
                      help="probe mode: directed probe for this SSID (default: "
                           "wildcard broadcast probe, like normal client scans)")
     inj.add_argument("--bssid", default="",
-                     help="pmf-test: YOUR AP's BSSID (unicast, required)")
+                     help="kick modes (pmf-test/deauth): YOUR AP's BSSID "
+                          "(unicast, required)")
     inj.add_argument("--client", default="",
-                     help="pmf-test: YOUR own test device's MAC (unicast, "
-                          "required; broadcast targets are refused)")
+                     help="kick modes: YOUR own test device's MAC (unicast, "
+                          "required; broadcast/multicast targets are refused)")
+    inj.add_argument("--frame-type", default="deauth", dest="frame_type",
+                     choices=["deauth", "disassoc", "both"],
+                     help="deauth mode: which disconnect frame to send "
+                          "(both alternates deauth+disassoc)")
+    inj.add_argument("--direction", default="ap-to-sta",
+                     choices=["ap-to-sta", "sta-to-ap"],
+                     help="deauth mode: spoofed direction (ap-to-sta is the "
+                          "classic client kick; sta-to-ap drops it AP-side)")
     inj.add_argument("--count", type=int, default=2,
-                     help="frames per channel (probe/canary) or deauth burst "
-                          "size (pmf-test); hard-capped for safety")
+                     help="frames per channel (probe/canary) or kick burst size "
+                          "(pmf-test/deauth); hard-capped per mode for safety")
     inj.add_argument("--dwell", type=float, default=0.0,
                      help="seconds to listen on each channel after a burst "
                           "(0 = sensible default per mode)")
@@ -362,8 +379,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="assert you own the target network / hold written "
                           "authorization to test it (required with --transmit)")
     inj.add_argument("--yes", action="store_true",
-                     help="required for pmf-test: acknowledge the named client "
-                          "will be briefly kicked if PMF is not enforced")
+                     help="required for kick modes (pmf-test, deauth): "
+                          "acknowledge the named client will be disconnected "
+                          "if management-frame protection is not enforced")
     inj.add_argument("--airmon", action="store_true")
     inj.add_argument("--no-monitor-setup", action="store_true")
     inj.add_argument("--audit-log", default="",
@@ -1277,8 +1295,9 @@ def cmd_inject(args) -> int:
     mode = args.mode
     bssid = client = ""
     try:
-        if mode == "pmf-test":
-            bssid, client = ij.validate_pmf_targets(args.bssid, args.client)
+        if mode in ij.KICK_MODES:
+            bssid, client = ij.validate_kick_targets(args.bssid, args.client,
+                                                     mode)
         # Consent + privilege gates (raise InjectionError with a clear reason).
         ij.gate_transmission(mode, transmit=args.transmit,
                              authorized=args.authorized,
@@ -1299,6 +1318,10 @@ def cmd_inject(args) -> int:
     transmit = args.transmit and args.authorized
     count = ij.clamp_count(mode, args.count)
     channels = ij.parse_channels(args.channels)
+    if mode in ij.KICK_MODES and not args.channels:
+        log.warning("no --channels given: targeting channel %s. Pass the AP's "
+                    "channel (-c CH) or the frames may not reach it.",
+                    channels[0])
     os.makedirs(args.output, exist_ok=True)
     audit_path = args.audit_log or os.path.join(args.output,
                                                 "injection_audit.csv")
@@ -1312,7 +1335,7 @@ def cmd_inject(args) -> int:
     try:
         if not transmit:
             print("DRY RUN: no frames will be transmitted. Add --transmit "
-                  "--authorized" + (" --yes" if mode == "pmf-test" else "") +
+                  "--authorized" + (" --yes" if mode in ij.KICK_MODES else "") +
                   " to actually emit. Preview:\n")
             inj = ij.Injector(iface, mode=mode, dry_run=True, audit=audit,
                               src_mac=src_mac)
@@ -1336,15 +1359,14 @@ def _build_preview(inj, mode, channels, args) -> None:
         token = args.token or ij.new_canary_token()
         print(f"canary token: {token}\n")
         inj.canary_sweep(channels, token, ij.clamp_count("canary", args.count))
-    elif mode == "pmf-test":
-        bssid, client = ij.validate_pmf_targets(args.bssid, args.client)
-        n = ij.clamp_count("pmf-test", args.count)
-        print(f"target: {bssid} -> {client}  ({n} deauth frames, reason="
-              f"{ij.DEAUTH_REASON})\n")
-        for _ in range(n):
-            pkt = ij.build_deauth(bssid, client)
-            inj._emit(pkt, frame="deauth", target=f"{bssid}->{client}",
-                      detail=f"reason={ij.DEAUTH_REASON}")
+    elif mode in ij.KICK_MODES:
+        bssid, client = ij.validate_kick_targets(args.bssid, args.client, mode)
+        n = ij.clamp_count(mode, args.count)
+        ftype = args.frame_type if mode == "deauth" else "deauth"
+        direction = args.direction if mode == "deauth" else "ap-to-sta"
+        print(f"target: {bssid} -> {client}   {n} {ftype} frame(s), "
+              f"direction={direction}\n")
+        inj.kick_burst(bssid, client, n, frame_type=ftype, direction=direction)
 
 
 def _inject_live(args, ij, mode, iface, channels, count, bssid, client,
@@ -1356,7 +1378,7 @@ def _inject_live(args, ij, mode, iface, channels, count, bssid, client,
 
     def _run(tx_iface: str) -> dict:
         inj.iface = tx_iface
-        if mode == "pmf-test":
+        if mode in ij.KICK_MODES:
             ij._set_channel(tx_iface, channels[0])
             dur = args.baseline_s + args.verify_s + 2.0
             listener = ij.AirListener(tx_iface, dur, pcap_path=pcap_path)
@@ -1365,12 +1387,19 @@ def _inject_live(args, ij, mode, iface, channels, count, bssid, client,
                   "on your AP...")
             time.sleep(args.baseline_s)
             burst_ts = time.time()
-            inj.deauth_burst(bssid, client, count)
-            print(f"sent {count} bounded deauth frame(s); observing "
-                  f"{args.verify_s:.0f}s for re-association...")
+            ftype = args.frame_type if mode == "deauth" else "deauth"
+            direction = args.direction if mode == "deauth" else "ap-to-sta"
+            inj.kick_burst(bssid, client, count, frame_type=ftype,
+                           direction=direction)
+            print(f"sent {count} bounded {ftype} frame(s); observing "
+                  f"{args.verify_s:.0f}s for disconnect / re-association...")
             time.sleep(args.verify_s)
             listener.join()
-            rep = ij.pmf_verdict(listener.events, bssid, client, burst_ts)
+            rep = ij.kick_verdict(listener.events, bssid, client, burst_ts)
+            rep["mode"] = mode
+            rep["frame_type"] = ftype
+            rep["direction"] = direction
+            rep["burst_sent"] = count
             rep["frames_seen"] = listener.frames
             rep["pcap"] = pcap_path or "-"
             return rep
@@ -1423,18 +1452,24 @@ def _inject_live(args, ij, mode, iface, channels, count, bssid, client,
             rep = _run(mon)
 
     # ---------------------------------------------------------------- report
-    if mode == "pmf-test":
-        print_rows("PMF / deauth-resistance self-test",
+    if mode in ij.KICK_MODES:
+        title = ("PMF / deauth-resistance self-test" if mode == "pmf-test"
+                 else "Deauthentication / disassociation test (authorised)")
+        print_rows(title,
                    [("Fact", "k"), ("Result", "v")],
                    [{"k": k, "v": v} for k, v in rep.items()])
         verdict = rep.get("verdict")
         if verdict == "pass":
-            print("\nPASS: forged deauth frames were ignored - PMF is "
-                  "protecting this client.")
+            print("\nPASS: the forged deauth/disassoc frames were ignored - "
+                  "management-frame protection (PMF/802.11w) is protecting "
+                  "this client.")
         elif verdict == "fail":
-            log.error("\nFAIL: the client was kicked and had to re-associate. "
-                      "PMF/802.11w is NOT enforced - set Management Frame "
-                      "Protection to REQUIRED on your AP and supplicant.")
+            log.error("\nKICKED: the client disconnected and had to "
+                      "re-associate. Management-frame protection (802.11w PMF) "
+                      "is NOT enforced - set it to REQUIRED on your AP and "
+                      "supplicant, then re-test. For a PMF verification this "
+                      "is FAIL; for a pen-test it confirms the client/AP are "
+                      "vulnerable to a kick attack.")
             return 1
         else:
             log.warning("\nINCONCLUSIVE: %s", rep.get("detail"))

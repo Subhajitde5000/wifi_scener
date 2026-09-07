@@ -13,6 +13,13 @@ passive listening alone cannot:
       frames at ONE of your own clients, then observes whether the client
       stays associated (PMF works) or gets kicked and re-joins (PMF missing).
 
+3. "Authorised deauthentication/disassociation testing of MY OWN network"
+   -> ``mode=deauth``     a bounded, unicast, explicitly-acknowledged burst
+      of deauth and/or disassociation frames aimed at ONE client you own, to
+      validate client resilience, IDS response and roaming. Larger than the
+      pmf-test probe but still hard-capped, one-shot, logged and target-
+      restricted - a pen-test action, never a sustained attack.
+
 ``mode=probe`` is ordinary active scanning - byte-for-byte the same probe
 requests every laptop/phone OS broadcasts while scanning for networks; it
 makes the survey deterministic instead of waiting for beacons.
@@ -26,19 +33,20 @@ Hard safety gates (every one enforced in code, not just documented)
 * root / admin privileges are required for ANY over-the-air transmission;
 * NOTHING is transmitted unless BOTH ``--transmit`` and ``--authorized`` are
   passed - the default is a dry run that only builds and displays frames;
-* ``pmf-test`` additionally requires ``--yes`` AND an explicit unicast
-  ``--bssid`` and ``--client`` - broadcast/multicast kicking is refused;
-* burst sizes are hard-capped below IDS flood thresholds and spaced out so
-  they can never constitute a flood;
+* the kick modes (``pmf-test`` AND ``deauth``) additionally require ``--yes``
+  AND an explicit unicast ``--bssid`` and ``--client`` - broadcast/multicast
+  or wildcard kicking is refused outright;
+* burst sizes are hard-capped per mode and spaced by a minimum interval so a
+  single run can never become a sustained flood/denial-of-service;
 * every frame (or would-be frame) is recorded in an owner-only (0600) audit CSV.
 
 What this module deliberately refuses to do
 -------------------------------------------
-deauth/disassoc FLOODS, broadcast or wildcard kicking, AP cloning or beacon
-forgery, channel jamming, replay of captured third-party frames, evil-twin
-operation, or any transmission outside airspace you own or are authorised
-to test. Those are attack tools, not defence tools, and they do not belong
-in a sensor.
+unbounded or looped deauth/disassoc FLOODS, broadcast or wildcard kicking,
+AP cloning or beacon forgery, channel jamming, replay of captured third-party
+frames, evil-twin operation, or any transmission outside airspace you own or
+are authorised to test. Those are attack tools, not defence tools, and they
+do not belong in a sensor.
 """
 from __future__ import annotations
 
@@ -54,20 +62,35 @@ from .privacy import secure_file
 from .util import is_root, log
 
 # ----------------------------------------------------------------- limits
-# Hard ceilings. These cannot be raised from the CLI by design: a defensive
-# self-test needs only a handful of frames, and staying under the IDS flood
-# threshold (default 5 deauths/10s -> we allow max 4 in a burst + spacing)
-# means even the test traffic itself never looks like an attack to a tuned
-# sensor at the default medium sensitivity.
+# Hard ceilings. These cannot be raised from the CLI by design. The pmf-test
+# stays deliberately below the IDS flood threshold (5 deauths/10 s at medium
+# sensitivity -> max 4) so the *probe* traffic never looks like an attack.
+# The explicit deauth/disassoc TEST mode is allowed a larger one-shot burst
+# (an authorised pen-test that intentionally exercises IDS response and the
+# client's resilience), but it remains bounded: a single run, a minimum
+# inter-frame spacing, and never a loop - so it cannot become a sustained
+# denial-of-service.
 MAX_PROBE_PER_CHANNEL = 6
 MAX_CANARY_PER_CHANNEL = 4
-MAX_DEAUTH_BURST = 4              # < Watchdog.effective_flood_n (5 at medium)
+MAX_DEAUTH_BURST = 4              # pmf-test: < Watchdog.effective_flood_n (5)
+MAX_KICK_BURST = 30              # deauth mode: hard one-shot total frame cap
 MIN_FRAME_INTERVAL_S = 0.30       # floor between transmitted frames
 DEFAULT_FRAME_INTERVAL_S = 0.45
+KICK_FRAME_INTERVAL_S = 0.30      # kick bursts use the floor spacing
 DEFAULT_DWELL_S = 2.5             # listen per channel after a probe burst
 PMF_BASELINE_S = 5.0             # observe client activity before the burst
 PMF_VERIFY_S = 8.0              # observe after the burst for re-association
 DEAUTH_REASON = 7               # Class-3 frame from non-associated STA (standard)
+DISASOC_REASON = 8            # Disassoc: disassociate due to STA leaving
+
+# 802.11 management-frame subtypes (IEEE 802.11).
+SUBTYPE_DEAUTH = 12
+SUBTYPE_DISASSOC = 10
+SUBTYPE_ASSOC_REQ = 0
+SUBTYPE_REASSOC_REQ = 2
+
+# Modes that send disconnect frames and therefore need the extra --yes gate.
+KICK_MODES = ("pmf-test", "deauth")
 
 BROADCAST = "FF:FF:FF:FF:FF:FF"
 CANARY_PREFIX = "WIFISCANNER-CANARY-"
@@ -116,14 +139,48 @@ def build_probe_request(src_mac: str, ssid: str = ""):
     return pkt
 
 
-def build_deauth(bssid: str, client: str, reason: int = DEAUTH_REASON):
-    """One 802.11 deauthentication frame, AP->STA direction (PMF test only)."""
+def build_deauth(bssid: str, client: str, reason: int = DEAUTH_REASON,
+                 direction: str = "ap-to-sta"):
+    """One 802.11 deauthentication frame.
+
+    direction="ap-to-sta" (default): the AP tells the client to leave
+    (addr1=STA, addr2/3=BSSID) - what a spoofed AP kick looks like.
+    direction="sta-to-ap": the client tells the AP it is leaving
+    (addr1/3=BSSID, addr2=STA) - the spoofed-client direction.
+    Authorised self-test on YOUR OWN BSS only; broadcast targets are refused.
+    """
     from scapy.all import Dot11, Dot11Deauth, RadioTap
     bssid, client = normalize(bssid), normalize(client)
+    if direction == "sta-to-ap":
+        return (RadioTap()
+                / Dot11(type=0, subtype=SUBTYPE_DEAUTH, addr1=bssid,
+                        addr2=client, addr3=bssid)
+                / Dot11Deauth(reason=reason))
     return (RadioTap()
-            / Dot11(type=0, subtype=12, addr1=client, addr2=bssid,
-                    addr3=bssid)
+            / Dot11(type=0, subtype=SUBTYPE_DEAUTH, addr1=client,
+                    addr2=bssid, addr3=bssid)
             / Dot11Deauth(reason=reason))
+
+
+def build_disassoc(bssid: str, client: str, reason: int = DISASOC_REASON,
+                   direction: str = "ap-to-sta"):
+    """One 802.11 disassociation frame (management subtype 10).
+
+    Disassociation is the "polite" cousin of deauthentication: it asks a
+    *currently associated* station to drop the association (it can re-associate
+    without re-authenticating). Same two directions as build_deauth.
+    """
+    from scapy.all import Dot11, Dot11Disas, RadioTap
+    bssid, client = normalize(bssid), normalize(client)
+    if direction == "sta-to-ap":
+        return (RadioTap()
+                / Dot11(type=0, subtype=SUBTYPE_DISASSOC, addr1=bssid,
+                        addr2=client, addr3=bssid)
+                / Dot11Disas(reason=reason))
+    return (RadioTap()
+            / Dot11(type=0, subtype=SUBTYPE_DISASSOC, addr1=client,
+                    addr2=bssid, addr3=bssid)
+            / Dot11Disas(reason=reason))
 
 
 # ------------------------------------------------------------- frame anatomy
@@ -141,12 +198,12 @@ def frame_summary(pkt) -> str:
         return f"probe-request  {d.addr2} -> broadcast  SSID={ssid or '<wildcard>'!r}"
     if t == 0 and st == 5:
         return f"probe-response {d.addr2} -> {d.addr1}"
-    if t == 0 and st in (12, 11):
-        reason = getattr(pkt.getlayer(Dot11Deauth) or pkt.getlayer(Dot11Disas),
-                         "reason", "?")
-        kind = "deauth" if st == 12 else "disassoc"
+    if t == 0 and st in (SUBTYPE_DEAUTH, SUBTYPE_DISASSOC):
+        layer = pkt.getlayer(Dot11Deauth) or pkt.getlayer(Dot11Disas)
+        reason = getattr(layer, "reason", "?")
+        kind = "deauth" if st == SUBTYPE_DEAUTH else "disassoc"
         return f"{kind}  {d.addr2} -> {d.addr1}  reason={reason}"
-    if t == 0 and st == 0:
+    if t == 0 and st in (SUBTYPE_ASSOC_REQ, SUBTYPE_REASSOC_REQ):
         return f"assoc-request  {d.addr2} -> {d.addr1}"
     if t == 2:
         return f"data  {d.addr2} -> {d.addr1}"
@@ -186,24 +243,26 @@ def gate_transmission(mode: str, *, transmit: bool, authorized: bool,
             "refusing to TRANSMIT: pass --authorized to confirm you own the "
             "target network (or are authorised in writing to test it), and "
             "--transmit to leave dry-run mode.")
-    if mode == "pmf-test" and not confirmed:
+    if mode in KICK_MODES and not confirmed:
         raise InjectionError(
-            "pmf-test sends deauthentication frames that will briefly kick "
-            "the named client if PMF is NOT enabled. It requires --yes in "
-            "addition to --authorized/--transmit, plus an explicit unicast "
-            "--bssid (YOUR AP) and --client (YOUR test device).")
+            f"{mode} sends deauthentication/disassociation frames that will "
+            "briefly disconnect the named client if management-frame "
+            "protection is NOT in force. It requires --yes in addition to "
+            "--authorized/--transmit, plus an explicit unicast --bssid "
+            "(YOUR AP) and --client (YOUR test device).")
     if not root:
         raise InjectionError(
             "over-the-air injection requires root privileges (run with sudo). "
             "Re-run without --transmit for a dry run that sends nothing.")
 
 
-def validate_pmf_targets(bssid: str, client: str) -> Tuple[str, str]:
-    """pmf-test may only aim a unicast burst at one named AP + one named STA."""
+def validate_kick_targets(bssid: str, client: str, mode: str = "pmf-test"
+                          ) -> Tuple[str, str]:
+    """A kick test may only aim a unicast burst at one named AP + one STA."""
     bssid, client = normalize(bssid or ""), normalize(client or "")
     if not bssid or not client:
         raise InjectionError(
-            "pmf-test requires --bssid <your-AP-MAC> and --client <your-test-"
+            f"{mode} requires --bssid <your-AP-MAC> and --client <your-test-"
             "device-MAC>. A broadcast/wildcard target is refused outright.")
     for label, mac in (("bssid", bssid), ("client", client)):
         if is_multicast(mac):
@@ -213,13 +272,19 @@ def validate_pmf_targets(bssid: str, client: str) -> Tuple[str, str]:
     return bssid, client
 
 
-def clamp_count(mode: str, count: int) -> int:
+# Backwards-compatible alias (older callers/tests use the pmf-test name).
+validate_pmf_targets = validate_kick_targets
+
+
+def clamp_count(mode: str, count: int, *, per_channel: bool = False) -> int:
     cap = {"probe": MAX_PROBE_PER_CHANNEL,
            "canary": MAX_CANARY_PER_CHANNEL,
-           "pmf-test": MAX_DEAUTH_BURST}[mode]
+           "pmf-test": MAX_DEAUTH_BURST,
+           "deauth": MAX_KICK_BURST}[mode]
     if count > cap:
-        log.warning("requested %d frames capped to the hard safety limit of %d "
-                    "for mode %s", count, cap, mode)
+        scope = "per channel" if per_channel else "per run"
+        log.warning("requested %d frames capped to the hard safety limit of "
+                    "%d (%s) for mode %s", count, cap, scope, mode)
     return max(1, min(int(count), cap))
 
 
@@ -312,9 +377,12 @@ def classify_frame(pkt) -> Optional[AirEvent]:
     if t == 0 and st == 5:
         return AirEvent(time.time(), "proberesp", a2, a1, a3 or a2, rssi,
                         _elt_ssid(pkt))
-    if t == 0 and st in (12, 11):
-        return AirEvent(time.time(), "deauth", a2, a1, a3 or a2, rssi)
-    if t == 0 and st in (0, 2):
+    if t == 0 and st in (SUBTYPE_DEAUTH, SUBTYPE_DISASSOC):
+        # Both deauth (12) and disassociation (10) are "kick" management
+        # frames; tagged distinctly so the verdict can count either.
+        kind = "deauth" if st == SUBTYPE_DEAUTH else "disassoc"
+        return AirEvent(time.time(), kind, a2, a1, a3 or a2, rssi)
+    if t == 0 and st in (SUBTYPE_ASSOC_REQ, SUBTYPE_REASSOC_REQ):
         return AirEvent(time.time(), "assoc", a2, a1, a3 or a1, rssi,
                         _elt_ssid(pkt))
     if t == 2:
@@ -459,11 +527,32 @@ class Injector:
                 self._emit(pkt, frame="canary-probe", channel=str(ch),
                            target=BROADCAST, detail=f"token={token}")
 
+    def kick_burst(self, bssid: str, client: str, count: int, *,
+                   frame_type: str = "deauth",
+                   direction: str = "ap-to-sta") -> None:
+        """Send a bounded, unicast burst of deauth and/or disassoc frames.
+
+        frame_type: "deauth" | "disassoc" | "both" (both alternates the two).
+        Authorised self-test on YOUR OWN BSS/client only. The deauth/disassoc
+        count and spacing are capped by the caller via clamp_count and the
+        injector's minimum interval.
+        """
+        bssid, client = normalize(bssid), normalize(client)
+        types = ["deauth", "disassoc"] if frame_type == "both" else [frame_type]
+        for i in range(count):
+            ftype = types[i % len(types)]
+            if ftype == "disassoc":
+                pkt = build_disassoc(bssid, client, direction=direction)
+                reason = DISASOC_REASON
+            else:
+                pkt = build_deauth(bssid, client, direction=direction)
+                reason = DEAUTH_REASON
+            self._emit(pkt, frame=ftype, target=f"{bssid}->{client}",
+                       detail=f"reason={reason} dir={direction}")
+
     def deauth_burst(self, bssid: str, client: str, count: int) -> None:
-        for _ in range(count):
-            pkt = build_deauth(bssid, client)
-            self._emit(pkt, frame="deauth", target=f"{bssid}->{client}",
-                       detail=f"reason={DEAUTH_REASON}")
+        """Backwards-compatible deauth-only burst used by the pmf-test."""
+        self.kick_burst(bssid, client, count, frame_type="deauth")
 
 
 def _set_channel(iface: str, channel: int) -> bool:
@@ -473,15 +562,25 @@ def _set_channel(iface: str, channel: int) -> bool:
 
 # ------------------------------------------------------------- verifications
 
+KICK_KINDS = ("deauth", "disassoc")
+
+
 def pmf_verdict(events: List[AirEvent], bssid: str, client: str,
                 burst_ts: float) -> dict:
-    """Decide whether the bounded deauth burst actually kicked the client.
+    """Backwards-compatible alias for :func:`kick_verdict`."""
+    return kick_verdict(events, bssid, client, burst_ts)
 
-    * client keeps exchanging data and never re-associates -> forged deauths
-      were IGNORED: PMF/802.11w is protecting management frames (PASS).
+
+def kick_verdict(events: List[AirEvent], bssid: str, client: str,
+                 burst_ts: float) -> dict:
+    """Decide whether a bounded deauth/disassoc burst actually kicked a client.
+
+    * client keeps exchanging data and never re-associates -> the forged
+      deauth/disassoc frames were IGNORED: PMF/802.11w is protecting the
+      management plane (PASS).
     * an (re)association or EAPOL from the client follows the burst -> the
-      client was deauthenticated and had to rejoin: PMF is NOT enforced
-      between this client and BSS (FAIL - fix the setting on both ends).
+      client was disconnected and had to rejoin: management frames are NOT
+      protected between this client and BSS (FAIL - fix PMF on both ends).
     * no client frames at all -> inconclusive (idle/asleep/off-channel).
     """
     bssid, client = normalize(bssid), normalize(client)
@@ -492,8 +591,12 @@ def pmf_verdict(events: List[AirEvent], bssid: str, client: str,
     data_before = sum(1 for e in before if e.kind == "data")
     data_after = sum(1 for e in after if e.kind == "data")
     reauth_after = [e for e in after if e.kind in ("assoc", "eapol")]
+    kicks_observed = sum(1 for e in events if e.kind in KICK_KINDS
+                         and _involves(e, bssid, client))
     deauths_observed = sum(1 for e in events if e.kind == "deauth"
                            and _involves(e, bssid, client))
+    disassocs_observed = sum(1 for e in events if e.kind == "disassoc"
+                             and _involves(e, bssid, client))
     if data_before == 0:
         verdict = "inconclusive"
         detail = ("no traffic from the client before the burst - it may be "
@@ -504,16 +607,17 @@ def pmf_verdict(events: List[AirEvent], bssid: str, client: str,
         verdict = "fail"
         protected = False
         detail = (f"client re-associated ({len(reauth_after)} assoc/EAPOL "
-                  "frame(s) after the burst): the forged deauth was "
-                  "ACCEPTED. PMF/802.11w is not protecting this client - "
-                  "set Management Frame Protection to REQUIRED on the AP "
-                  "and the client supplicant, then re-test")
+                  "frame(s) after the burst): the forged deauth/disassoc "
+                  "frame was ACCEPTED. Management-frame protection (802.11w "
+                  "PMF) is not protecting this client - set it to REQUIRED "
+                  "on the AP and the client supplicant, then re-test")
     elif data_after > 0:
         verdict = "pass"
         protected = True
         detail = (f"client kept exchanging data ({data_after} frame(s)) and "
-                  "never re-associated: forged deauthentication frames were "
-                  "ignored - PMF is working on this BSS")
+                  "never re-associated: the forged deauthentication/"
+                  "disassociation frames were ignored - PMF is working on "
+                  "this BSS")
     else:
         verdict = "inconclusive"
         protected = None
@@ -522,7 +626,9 @@ def pmf_verdict(events: List[AirEvent], bssid: str, client: str,
     return {"verdict": verdict, "pmf_protected": protected,
             "data_before": data_before, "data_after": data_after,
             "reauth_after": len(reauth_after),
-            "deauths_observed": deauths_observed, "detail": detail}
+            "kicks_observed": kicks_observed,
+            "deauths_observed": deauths_observed,
+            "disassocs_observed": disassocs_observed, "detail": detail}
 
 
 def _involves(e: AirEvent, bssid: str, client: str) -> bool:
@@ -549,13 +655,19 @@ def ids_selftest_scenarios():
     """(name, [frames], expected_alert_kinds) synthesised entirely offline."""
     from scapy.all import Dot11, RadioTap
     from scapy.layers.dot11 import (Dot11AssoReq, Dot11Beacon, Dot11Deauth,
-                                    Dot11Elt)
+                                    Dot11Disas, Dot11Elt)
     ap, sta = "F0:9F:C2:11:22:34", "AC:BC:32:01:02:99"
 
     def deauth():
         return (RadioTap() / Dot11(type=0, subtype=12, addr1=sta,
                                    addr2=ap, addr3=ap)
                 / Dot11Deauth(reason=7))
+
+    def disassoc():
+        # subtype 10: disassociation - the "polite" kick, also PMF-protected
+        return (RadioTap() / Dot11(type=0, subtype=10, addr1=sta,
+                                   addr2=ap, addr3=ap)
+                / Dot11Disas(reason=8))
 
     def assoc():
         return (RadioTap() / Dot11(type=0, subtype=0, addr1=ap, addr2=sta,
@@ -590,6 +702,9 @@ def ids_selftest_scenarios():
     return [
         ("deauth-flood detection",
          [deauth() for _ in range(6)],
+         {"deauth-flood"}),
+        ("disassociation-flood detection",
+         [disassoc() for _ in range(6)],
          {"deauth-flood"}),
         ("forced-reauth / handshake-harvest chain",
          [assoc(), eapol()],
