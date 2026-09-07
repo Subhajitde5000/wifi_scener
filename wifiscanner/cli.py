@@ -6,7 +6,7 @@ import os
 import sys
 import time
 
-from . import __version__
+from . import __version__, inject as ij
 from .backends import lan, sniffer, survey
 from .display import (print_banner, print_congestion, print_detail,
                       print_devices, print_networks, print_rogues,
@@ -20,12 +20,18 @@ from .store import Store, parse_when
 from .util import is_root, log, os_name, setup_logging
 
 LEGAL = (
-    "SCOPE: passive, defensive, own-network-first. This tool listens to what "
-    "is broadcast in public airspace and reads YOUR OWN router's association "
-    "table; it never transmits, injects, deauthenticates, clones APs, cracks "
-    "keys or decrypts traffic - those features are deliberately NOT part of "
-    "this tool (see README). Continuous history recording is restricted to "
-    "your own network. Use on your own infrastructure or with written consent."
+    "SCOPE: passive, defensive, own-network-first. Every survey, IDS, audit "
+    "and history feature only listens to what is broadcast in public "
+    "airspace and reads YOUR OWN router's association table. The single "
+    "exception is `inject`, which can transmit - but only as an explicit, "
+    "opt-in, AUTHORIZED self-test of your own defences (IDS sensor canaries, "
+    "active probe scanning, a bounded own-AP PMF/deauth-resistance check). "
+    "It defaults to a DRY RUN (nothing emitted), needs root plus --authorized "
+    "(--yes for deauth frames), is hard rate-capped below attack thresholds, "
+    "refuses broadcast/third-party targets, and logs every frame. It contains "
+    "no flood, AP-clone, jam, key-crack or decrypt capability. Continuous "
+    "history recording is restricted to your own network. Use transmission "
+    "only on infrastructure you own or are authorised in writing to test."
 )
 
 
@@ -53,6 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
   wifiscanner audit                           hardening report for YOUR network
   wifiscanner frames capture.pcap             802.11 frame-by-frame anatomy
                                               (how all of this works)
+  wifiscanner inject --mode ids-selftest      offline test: does MY IDS detect
+                                              deauth/beacon/warden signatures?
+  wifiscanner inject --mode canary -i wlan0   dry run by default: preview the
+      --channels 1,6,11                          probe markers, add --transmit
+                                              --authorized to actually emit
+  wifiscanner inject --mode pmf-test -i wlan0 --channel 6 --bssid MY-AP \\
+      --client MY-test-laptop --transmit --authorized --yes
   wifiscanner interfaces                    list wireless adapters
 """)
     p.add_argument("--version", action="version", version=f"wifiscanner {__version__}")
@@ -307,6 +320,59 @@ def build_parser() -> argparse.ArgumentParser:
                     help="beacon|probe-req|assoc-req|deauth|disassoc|data|handshake")
     fr.add_argument("--handshakes", action="store_true",
                     help="just summarise EAPOL/deauth activity (counts only)")
+
+    inj = sub.add_parser("inject", help="AUTHORIZED transmission for defensive "
+                         "self-test only: IDS canaries, active probe scan, and a "
+                         "bounded own-AP PMF/deauth-resistance test. Dry run by "
+                         "default; needs root + --authorized (+--yes for deauth).")
+    inj.add_argument("-i", "--interface", default="", help="wireless interface")
+    inj.add_argument("--mode", default="probe",
+                     choices=["probe", "canary", "pmf-test", "ids-selftest"],
+                     help="probe = active survey; canary = IDS/sensor coverage "
+                          "marker; pmf-test = verify YOUR AP enforces PMF; "
+                          "ids-selftest = offline, zero-RF IDS signature check")
+    inj.add_argument("-c", "--channels", default="",
+                     help="comma list, e.g. 1,6,11 (pmf-test: the AP's channel)")
+    inj.add_argument("--ssid", default="",
+                     help="probe mode: directed probe for this SSID (default: "
+                          "wildcard broadcast probe, like normal client scans)")
+    inj.add_argument("--bssid", default="",
+                     help="pmf-test: YOUR AP's BSSID (unicast, required)")
+    inj.add_argument("--client", default="",
+                     help="pmf-test: YOUR own test device's MAC (unicast, "
+                          "required; broadcast targets are refused)")
+    inj.add_argument("--count", type=int, default=2,
+                     help="frames per channel (probe/canary) or deauth burst "
+                          "size (pmf-test); hard-capped for safety")
+    inj.add_argument("--dwell", type=float, default=0.0,
+                     help="seconds to listen on each channel after a burst "
+                          "(0 = sensible default per mode)")
+    inj.add_argument("--baseline-s", type=float, default=5.0,
+                     help="pmf-test: observe client activity before the burst")
+    inj.add_argument("--verify-s", type=float, default=8.0,
+                     help="pmf-test: observe for re-association after the burst")
+    inj.add_argument("--token", default="", help="canary: marker SSID (auto if "
+                                                 "blank; grep this in sensor logs)")
+    inj.add_argument("--src-mac", default="",
+                     help="source MAC (default: random locally-administered)")
+    inj.add_argument("--transmit", action="store_true",
+                     help="actually emit frames over the air (WITHOUT this flag "
+                          "the command is a dry run that only builds/displays)")
+    inj.add_argument("--authorized", action="store_true",
+                     help="assert you own the target network / hold written "
+                          "authorization to test it (required with --transmit)")
+    inj.add_argument("--yes", action="store_true",
+                     help="required for pmf-test: acknowledge the named client "
+                          "will be briefly kicked if PMF is not enforced")
+    inj.add_argument("--airmon", action="store_true")
+    inj.add_argument("--no-monitor-setup", action="store_true")
+    inj.add_argument("--audit-log", default="",
+                     help="CSV audit trail of every frame (default: "
+                          "<output>/injection_audit.csv); always written 0600")
+    inj.add_argument("--write-pcap", default="",
+                     help="also record the verification window to a pcap")
+    inj.add_argument("-o", "--output", default="output", metavar="DIR",
+                     help="directory for the audit log / pcap (default: ./output)")
 
     dbp = sub.add_parser("db", help="history-database maintenance: retention, "
                          "anonymization, deletion (privacy controls)")
@@ -1168,6 +1234,220 @@ def cmd_frames(args) -> int:
     return 0
 
 
+# ------------------------------------------------- authorized injection
+
+def cmd_inject(args) -> int:
+    """Transmit frames ONLY as an authorized, logged, bounded self-test.
+
+    Defaults to a dry run that builds/describes frames and writes the audit
+    trail without touching the radio, so the operator can preview an action.
+    Live emission requires root + --transmit + --authorized (and --yes for
+    the bounded pmf-test); broadcast/third-party targets are refused.
+    """
+    # ------------------------------------------------ offline, zero-RF mode
+    if args.mode == "ids-selftest":
+        pcap = args.write_pcap or (os.path.join(args.output,
+                                                "ids_selftest.pcap")
+                                   if args.output else "")
+        print("IDS self-test: synthesising attack signatures OFFLINE (no "
+              "radio, no root) and confirming the watchdog fires on each.\n")
+        rep = ij.run_ids_selftest(write_pcap=pcap)
+        print_rows("IDS signature self-test",
+                   [("Scenario", "scenario"), ("Expected", "expected"),
+                    ("Fired", "fired"), ("Missing", "missing"),
+                    ("Status", "status")], rep["rows"])
+        all_pass = rep["passed"] == rep["total"]
+        print(f"\nwatchdog saw {rep['frames']} synthetic frames -> "
+              f"{rep['alerts']} alerts; {rep['passed']}/{rep['total']} "
+              f"signatures detected.")
+        if pcap and os.path.exists(pcap):
+            print(f"synthetic-signature pcap (for `ids --pcap`): {pcap}")
+        if not all_pass:
+            log.error("IDS did NOT fire on every signature - investigate "
+                      "sensor coverage before trusting live detection.")
+            return 1
+        print("all signatures detected: this sensor's detection path works.")
+        return 0
+
+    # ---------------------------------------------------- live modes
+    if not sniffer.scapy_available():
+        log.error("scapy required for injection:  pip install scapy")
+        return 2
+
+    mode = args.mode
+    bssid = client = ""
+    try:
+        if mode == "pmf-test":
+            bssid, client = ij.validate_pmf_targets(args.bssid, args.client)
+        # Consent + privilege gates (raise InjectionError with a clear reason).
+        ij.gate_transmission(mode, transmit=args.transmit,
+                             authorized=args.authorized,
+                             confirmed=args.yes)
+    except ij.InjectionError as exc:
+        log.error("%s", exc)
+        return 2
+
+    iface = args.interface
+    if not iface:
+        ifaces = survey.list_interfaces()
+        if not ifaces:
+            log.error("no wireless interface found; specify one with -i")
+            return 2
+        iface = ifaces[0]["name"]
+        log.info("using interface %s", iface)
+
+    transmit = args.transmit and args.authorized
+    count = ij.clamp_count(mode, args.count)
+    channels = ij.parse_channels(args.channels)
+    os.makedirs(args.output, exist_ok=True)
+    audit_path = args.audit_log or os.path.join(args.output,
+                                                "injection_audit.csv")
+    # A verification pcap only makes sense when frames actually go out.
+    pcap_path = args.write_pcap
+    if transmit and not pcap_path:
+        pcap_path = os.path.join(args.output, f"inject-{mode}.pcap")
+    audit = ij.AuditLog(audit_path)
+    src_mac = args.src_mac or ij.random_local_mac()
+
+    try:
+        if not transmit:
+            print("DRY RUN: no frames will be transmitted. Add --transmit "
+                  "--authorized" + (" --yes" if mode == "pmf-test" else "") +
+                  " to actually emit. Preview:\n")
+            inj = ij.Injector(iface, mode=mode, dry_run=True, audit=audit,
+                              src_mac=src_mac)
+            _build_preview(inj, mode, channels, args)
+            print(f"\naudit trail: {audit_path}")
+            print(f"frames built: {inj.built}; frames transmitted: 0")
+            return 0
+
+        return _inject_live(args, ij, mode, iface, channels, count, bssid,
+                            client, src_mac, audit, audit_path, pcap_path)
+    finally:
+        audit.close()
+
+
+def _build_preview(inj, mode, channels, args) -> None:
+    """Populate the audit log in dry-run mode and show the would-be frames."""
+    if mode == "probe":
+        ssids = [s.strip() for s in args.ssid.split(",") if s.strip()] or [""]
+        inj.probe_sweep(channels, ssids, ij.clamp_count("probe", args.count))
+    elif mode == "canary":
+        token = args.token or ij.new_canary_token()
+        print(f"canary token: {token}\n")
+        inj.canary_sweep(channels, token, ij.clamp_count("canary", args.count))
+    elif mode == "pmf-test":
+        bssid, client = ij.validate_pmf_targets(args.bssid, args.client)
+        n = ij.clamp_count("pmf-test", args.count)
+        print(f"target: {bssid} -> {client}  ({n} deauth frames, reason="
+              f"{ij.DEAUTH_REASON})\n")
+        for _ in range(n):
+            pkt = ij.build_deauth(bssid, client)
+            inj._emit(pkt, frame="deauth", target=f"{bssid}->{client}",
+                      detail=f"reason={ij.DEAUTH_REASON}")
+
+
+def _inject_live(args, ij, mode, iface, channels, count, bssid, client,
+                 src_mac, audit, audit_path, pcap_path) -> int:
+    """Actually transmit. Assumes consent gates have already passed + root."""
+    from .display import print_rows
+    inj = ij.Injector(iface, mode=mode, dry_run=False, audit=audit,
+                      src_mac=src_mac)
+
+    def _run(tx_iface: str) -> dict:
+        inj.iface = tx_iface
+        if mode == "pmf-test":
+            ij._set_channel(tx_iface, channels[0])
+            dur = args.baseline_s + args.verify_s + 2.0
+            listener = ij.AirListener(tx_iface, dur, pcap_path=pcap_path)
+            listener.start()
+            print(f"baseline: listening {args.baseline_s:.0f}s for {client} "
+                  "on your AP...")
+            time.sleep(args.baseline_s)
+            burst_ts = time.time()
+            inj.deauth_burst(bssid, client, count)
+            print(f"sent {count} bounded deauth frame(s); observing "
+                  f"{args.verify_s:.0f}s for re-association...")
+            time.sleep(args.verify_s)
+            listener.join()
+            rep = ij.pmf_verdict(listener.events, bssid, client, burst_ts)
+            rep["frames_seen"] = listener.frames
+            rep["pcap"] = pcap_path or "-"
+            return rep
+        # probe / canary: a long-running listener; burst + dwell per channel
+        dwell = args.dwell or ij.DEFAULT_DWELL_S
+        n_ssid = len([s for s in args.ssid.split(",") if s.strip()] or [""])
+        total_dur = len(channels) * (
+            dwell + count * n_ssid * inj.interval + 2.0) + 2
+        listener = ij.AirListener(tx_iface, total_dur, pcap_path=pcap_path)
+        listener.start()
+        if mode == "probe":
+            ssids = [s.strip() for s in args.ssid.split(",") if s.strip()] or [""]
+            for ch in channels:
+                ij._set_channel(tx_iface, ch)
+                for ssid in ssids:
+                    for _ in range(count):
+                        inj._emit(ij.build_probe_request(src_mac, ssid),
+                                  frame="probe-request", channel=str(ch),
+                                  target=ij.BROADCAST,
+                                  detail=f"ssid={ssid or '<wildcard>'}")
+                time.sleep(dwell)
+            listener.join()
+            responses = [e for e in listener.events if e.kind == "proberesp"]
+            bssids = sorted({(normalize(e.bssid), e.ssid) for e in responses})
+            return {"mode": "probe", "channels": ",".join(map(str, channels)),
+                    "probe_responses": len(responses),
+                    "distinct_bss": len(bssids),
+                    "networks": "|".join(f"{s}@{b}" for b, s in bssids[:30]),
+                    "sent": inj.sent, "pcap": pcap_path or "-"}
+        token = args.token or ij.new_canary_token()
+        print(f"canary token: {token}")
+        print("every remote IDS/capture sensor must now report this token; "
+              "grep it in their logs/pcaps.")
+        for ch in channels:
+            ij._set_channel(tx_iface, ch)
+            for _ in range(count):
+                inj._emit(ij.build_probe_request(src_mac, token),
+                          frame="canary-probe", channel=str(ch),
+                          target=ij.BROADCAST, detail=f"token={token}")
+            time.sleep(dwell)
+        listener.join()
+        rep = ij.canary_results(listener.events, src_mac, token)
+        rep.update({"mode": "canary", "sent": inj.sent, "pcap": pcap_path or "-"})
+        return rep
+
+    if args.no_monitor_setup:
+        rep = _run(iface)
+    else:
+        with sniffer.MonitorMode(iface, use_airmon=args.airmon) as mon:
+            rep = _run(mon)
+
+    # ---------------------------------------------------------------- report
+    if mode == "pmf-test":
+        print_rows("PMF / deauth-resistance self-test",
+                   [("Fact", "k"), ("Result", "v")],
+                   [{"k": k, "v": v} for k, v in rep.items()])
+        verdict = rep.get("verdict")
+        if verdict == "pass":
+            print("\nPASS: forged deauth frames were ignored - PMF is "
+                  "protecting this client.")
+        elif verdict == "fail":
+            log.error("\nFAIL: the client was kicked and had to re-associate. "
+                      "PMF/802.11w is NOT enforced - set Management Frame "
+                      "Protection to REQUIRED on your AP and supplicant.")
+            return 1
+        else:
+            log.warning("\nINCONCLUSIVE: %s", rep.get("detail"))
+            return 3
+    else:
+        print_rows(f"Injection result ({rep.get('mode')})",
+                   [(k, k) for k in rep], [rep])
+    print(f"\ntransmitted {inj.sent} frame(s); audit trail: {audit_path}")
+    if pcap_path and os.path.exists(pcap_path):
+        print(f"verification capture: {pcap_path}")
+    return 0
+
+
 def cmd_db(args) -> int:
     """History-database maintenance: retention, anonymization, deletion."""
     if not os.path.exists(args.db) and not args.report:
@@ -1264,7 +1544,7 @@ def main(argv=None) -> int:
           "own": cmd_own, "record": cmd_record, "presence": cmd_presence,
           "locate": cmd_locate, "trail": cmd_trail, "capture": cmd_capture,
           "traffic": cmd_traffic, "ids": cmd_ids, "audit": cmd_audit,
-          "frames": cmd_frames, "db": cmd_db}[args.cmd]
+          "frames": cmd_frames, "inject": cmd_inject, "db": cmd_db}[args.cmd]
     try:
         return fn(args)
     except KeyboardInterrupt:
