@@ -333,8 +333,8 @@ Streaming pcap writer (never buffers in RAM): `--rotate-mb 64` starts
 fixed disk budget for 24/7). `--analyze` parses into AP/client tables at
 exit. Ctrl-C finalises. Flags: `-i -d -c --bands --bssid --hop-interval -o
 FILE --rotate-mb --ring-segments --airmon --no-monitor-setup`,
-plus the sensitivity guardrails: `--ack-sensitive` (**required** — explicit
-opt-in acknowledging captures hold third-party data),
+plus the sensitivity guardrails: `--ack-sensitive` (acknowledges captures
+hold third-party data; without it you get a loud warning, never a refusal),
 `--strip-payloads` (128-byte snaplen: headers for counting/IDS, no payloads),
 `--max-age-days N` (delete expired segments on exit). Files are written
 owner-only (0600).
@@ -847,7 +847,7 @@ merged, here or in forks.
   (standard/minimal/ephemeral), salted MAC pseudonyms, auto-enforced retention,
   `db` maintenance (report/prune/erase/anonymize/purge/vacuum); zone-primary
   location with confidence + withheld low-confidence coordinates; capture
-  opt-in (`--ack-sensitive`), payload-stripping snaplen, 0600 secure storage
+  acknowledgement (`--ack-sensitive`, warns-only), payload-stripping snaplen, 0600 secure storage
   everywhere; traffic redaction ON by default; IDS confidence/status/evidence,
   `--sensitivity`, beacon persistence, adaptive noisy-air margin; multi-indicator
   rogue scoring (≥2 indicators to declare). **76 tests**.
@@ -882,7 +882,7 @@ to disk is minimised, permission-locked and retention-bounded.**
 | 2 | Randomized MACs | `identity_report()`: observed-MAC ranges (min–max physical devices); `identity_note` disclaims **both** directions (distinct rotating addresses are neither distinct devices nor the same device); `oui.classify_mac()` (`models.py`, `engine.py`, `oui.py`) |
 | 3 | Long-term tracking | `--privacy-mode standard/minimal/ephemeral`, `--anonymize` (salted HMAC pseudonyms, no hostnames/IPs/probes), auto-enforced retention (default 90 d), anonymized exports (`privacy.py`, `store.py`, `export.py`, `cli.py`) |
 | 4 | Noisy location | Every fix: error radius + `confidence` + `zone_confidence`; **zone is the primary answer**; low-confidence coordinates withheld (`Fix.display`); RSSI-spread demotion (`locate.py`) |
-| 5 | Sensitive raw PCAP | `--ack-sensitive` opt-in (**required**), `--strip-payloads` 128-B header-only captures, `--max-age-days` retention, 0600 files (`cli.py`, `backends/sniffer.py`) |
+| 5 | Sensitive raw PCAP | `--ack-sensitive` acknowledgement (warns, never blocks), `--strip-payloads` 128-B header-only captures, `--max-age-days` retention, 0600 files (`cli.py`, `backends/sniffer.py`) |
 | 6 | Traffic-analysis exposure | Metadata-minimal + **redaction ON by default** (URL queries stripped, UA→product token, hostnames truncated, credential patterns scrubbed, values never logged); `--anonymize-ips` for shared reports (`traffic.py`, `privacy.py`) |
 | 7 | IDS false positives | Per-alert `confidence`/`status`/`evidence` + “to confirm” hints, `--sensitivity`, beacon persistence (single sighting = 45, persisted = 78), adaptive noisy-air margin, cross-alert corroboration (`defense.py`) |
 | 8 | Ambiguous rogue APs | Noisy-OR scoring over 7 independent indicators; `likely-rogue` needs **≥2 indicators and score ≥ 40**; single-indicator groups listed as `unconfirmed`/`low` and never counted (`engine.py`) |
@@ -897,3 +897,4 @@ Operational notes:
   written to exports; per-export salts make shared reports unlinkable.
 * `ephemeral` mode makes persistence calls raise instead of writing — use it for
   live triage on airspace you must not retain data about.
+ain data about.

@@ -240,9 +240,8 @@ def build_parser() -> argparse.ArgumentParser:
     cap.add_argument("--analyze", action="store_true",
                      help="also parse the capture into AP/client tables at exit")
     cap.add_argument("--ack-sensitive", action="store_true",
-                     help="REQUIRED: acknowledge that raw captures contain "
-                          "sensitive third-party data and that you are "
-                          "authorized to collect it here")
+                     help="acknowledge that raw captures contain sensitive "
+                          "third-party data (silences the warning)")
     cap.add_argument("--strip-payloads", action="store_true",
                      help="privacy-preserving capture: truncate frames to 128 "
                           "bytes (headers for counting/IDS, no payloads)")
@@ -883,12 +882,10 @@ def cmd_trail(args) -> int:
 def cmd_capture(args) -> int:
     """Raw frame capture with rotation / ring buffer. Passive only."""
     if not args.ack_sensitive:
-        log.error("refusing: raw captures contain sensitive third-party data "
-                  "(payloads, identifiers). Re-run with --ack-sensitive to "
-                  "confirm you are authorized to collect here, or add "
-                  "--strip-payloads for a privacy-preserving header-only "
-                  "capture (still requires --ack-sensitive).")
-        return 2
+        log.warning("raw captures contain sensitive third-party data "
+                    "(payloads, identifiers) — collect only where authorized; "
+                    "add --strip-payloads for a privacy-preserving header-only "
+                    "capture, or --ack-sensitive to silence this warning")
     if not sniffer.scapy_available():
         log.error("scapy required:  pip install scapy")
         return 2
@@ -1215,10 +1212,8 @@ def cmd_db(args) -> int:
             print(f"erased {n} row(s) for {args.delete_mac}")
         if args.anonymize_db or args.purge:
             if not args.yes:
-                log.error("refusing destructive action without --yes "
-                          "(--anonymize-db is IRREVERSIBLE; --purge deletes "
-                          "all history)")
-                return 2
+                log.warning("proceeding without --yes: --anonymize-db is "
+                            "IRREVERSIBLE and --purge deletes all history")
             if args.anonymize_db:
                 n = st.anonymize_history()
                 print(f"anonymized {n} row(s) — MACs are now salted "

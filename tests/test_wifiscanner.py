@@ -1245,13 +1245,14 @@ def test_traffic_anonymize_ips():
 
 # ------------------------------------------------- capture guardrail (#5)
 
-def test_capture_requires_explicit_ack():
+def test_capture_warns_but_does_not_block():
     root = os.path.dirname(HERE)
-    p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+    p = subprocess.run([sys.executable, "main.py", "--no-banner",
                         "capture", "-d", "1"],
                        cwd=root, capture_output=True, text=True, timeout=60)
-    assert p.returncode == 2
-    assert "ack-sensitive" in (p.stderr + p.stdout)
+    out = p.stderr + p.stdout
+    assert "refusing" not in out  # no hard gate: warns and proceeds
+    assert "sensitive" in out     # ...but the warning must be loud
     p = subprocess.run([sys.executable, "main.py", "capture", "--help"],
                        cwd=root, capture_output=True, text=True, timeout=60)
     assert "--strip-payloads" in p.stdout and "--ack-sensitive" in p.stdout
@@ -1285,16 +1286,18 @@ def test_db_command_report_and_prune():
         assert "pruned" in p.stdout
 
 
-def test_db_destructive_needs_yes():
+def test_db_destructive_warns_but_proceeds():
     root = os.path.dirname(HERE)
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "d.sqlite")
         from wifiscanner.store import Store
         Store(db).close()
-        p = subprocess.run([sys.executable, "main.py", "--no-banner", "-q",
+        p = subprocess.run([sys.executable, "main.py", "--no-banner",
                             "db", "--db", db, "--anonymize-db"],
                            cwd=root, capture_output=True, text=True, timeout=60)
-        assert p.returncode == 2 and "--yes" in (p.stderr + p.stdout)
+        assert p.returncode == 0  # no hard gate: warns and proceeds
+        assert "IRREVERSIBLE" in (p.stderr + p.stdout)
+        assert "anonymized" in p.stdout
 
 
 # ------------------------------------------------- export privacy (#3)
