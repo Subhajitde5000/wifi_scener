@@ -5,8 +5,11 @@ positioning · raw capture · cleartext-traffic audit · wireless IDS ·
 hardening reports · 802.11 frame anatomy — one terminal tool, everything in
 CSV/JSON/HTML.**
 
-Version 2.5.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
-dependencies · receive-only except for one consent-gated defensive self-test.
+Version 4.1.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
+dependencies · receive-only except for one consent-gated defensive self-test,
+a local synthetic-credential phishing-awareness lab (`lab`), and an offline
+WPA decryption laboratory working only on lab captures with lab key material
+(`wpa-lab`).
 
 ```
  __      __.__  _____.__    _________
@@ -116,6 +119,14 @@ how to close it) and `ids` (what each attack *looks like* on the wire).
 | 16 | Live dashboard | `watch` | no | optional |
 | 17 | Structured export: 5 CSVs + JSON + HTML + Markdown | `-o --format` everywhere | no | no |
 | 18 | **Authorized** packet injection: offline IDS signature self-test (incl. disassoc-flood), active probe scan, IDS coverage canaries, bounded own-AP PMF check, bounded unicast **deauth/disassoc** test, and a **beacon-only Evil-Twin detection drill** (no serving/credential/data path) | `inject` | no (selftest) / yes (live) | yes (live only) |
+| 19 | Captive-portal phishing **awareness lab**: fake Wi-Fi login portal, synthetic test accounts, submission detection/logging, live instructor dashboard, attacker-view debrief, spot-the-fake indicators, legit-vs-phishing comparison, one-click reset — all LOCAL, no RF, synthetic credentials only | `lab` | no | no |
+| 20 | **WPA/WPA2/WPA3 decryption laboratory**: real 4-way-handshake parsing and offline key verification (MIC), authorised CCMP-128/256 + GCMP decryption of lab captures with lab key material (passphrase/PSK/PMK), GTK broadcast recovery, missing-handshake + wrong-key failure cases, before/after visibility tables, fixture generator, guided exercises, student+instructor web UIs — stdlib crypto checked against FIPS-197/RFC 3610/4493/3394/NIST-GCM vectors | `wpa-lab` | no | no (works on pcap files) |
+| 21 | **MAC randomization & deanonymization laboratory**: synthetic multi-sensor probe dataset (Radiotap pcaps), evidence engine with named support/anti-evidence and graduated hypothesis verdicts, rotation hand-offs, twin-decoy false-positive trap (simultaneity defeats fingerprint merging), scored clustering exercise, student portal + token-gated instructor dashboard with one-click fresh-dataset regeneration | `mac-lab` | no | no (synthetic dataset) |
+| 22 | **Long-term device tracking laboratory**: 2-week synthetic multi-sensor history — visit sessionization, weekday/hour heatmaps, dwell, movement edges, short vs long retention contrast, decoy (same-OUI) attribution trap, MAC-rotating visitor proving the privacy defence works, scored quiz, student portal + instructor dashboard with reset + regenerate | `track-lab` | no | no (synthetic dataset) |
+| 23 | **Hidden monitoring & stealth detection laboratory**: synthetic 4-day host telemetry (procs/conns/files/auth.log/services) with a concealed implant — install, night-flip, ps-vs-ss concealment, audit gap, repawn+rename, unlink-while-running; explainable signal engine, behaviour-change alerts, authorised-vs-covert comparison, scored hunt, instructor console (tick control, reset, regenerate) | `stealth-lab` | no | no (synthetic telemetry) |
+| 24 | **Automatic (offensive) response laboratory**: seeded IDS events on designated lab test devices, rulebook R1–R6 (aggressive R6 ships disabled), modes dry-run / approval / auto / manual, simulated firewall state, approval queue, rollback, full detect→decide→respond→result audit trail, FP metrics incl. the friendly-fire trap (R6 + no allowlist = your own scanner blocked) | `response-lab` | no | no (simulated lab network) |
+| 25 | **Large-scale scanning & scope-control laboratory**: virtual lab estate (10.77.*) with services/online flags/duplicate-IP conflicts; simulated concurrent scans with live progress + rate limiting; scope sentinel refusing non-inventoried/out-of-subnet targets before probing with loud alerts; targeted-vs-uncontrolled comparison; CSV export; instructor expand/reset/regenerate | `scan-lab` | no | no (virtual estate) |
+| 26 | **Credential & session security laboratory**: lab-generated capture twins plaintext and TLS legs of the same synthetic identities — base64 basic-auth, form posts, FTP, Telnet keystrokes, SNMPv1 community strings, replayable cookies all decoded and counted; TLS leg proven opaque except SNI; insecure-auth alert table; report bundle; instructor regenerates/destroys identities at will | `cred-lab` | no | no (lab capture) |
 
 ---
 
@@ -285,7 +296,21 @@ python3 main.py frames tests/fixture.pcap --filter beacon
 | `wifiscanner/inject.py` | the *only* transmitter: frame builders (probe/deauth/**disassoc**/**beacon**, both directions), consent+privilege gates, hard frame/duration caps, owner-only audit CSV, offline `run_ids_selftest` (deauth + disassoc signatures), kick/PMF verdict, canary analysis, and the **beacon-only** evil-twin detection drill; dry run by default |
 | `wifiscanner/export.py` | CSV×5 / JSON / styled HTML / Markdown writers |
 | `wifiscanner/display.py` | rich tables/panels with full plain-text fallback |
-| `wifiscanner/cli.py` | argparse surface, 18 commands, guardrails |
+| `wifiscanner/wcrypto.py` | stdlib-only AES/CCM/GCM/CMAC/KW/RC4/WEP/TKIP-Michael + PTK/PMK derivation, pinned to published vectors |
+| `wifiscanner/wpalab.py` | WPA-lab engine & fixtures: pcap/Radiotap/802.11/RSN/EAPOL parsing, MIC key verification, authorised CCMP/GCMP decryption, GTK unwrap, exports, student/instructor web UI |
+| `wifiscanner/lab.py` | captive-portal phishing-awareness lab (offline, synthetic credentials, instructor dashboard) |
+| `wifiscanner/devlab.py` | mac-lab + track-lab: dataset generators (Radiotap pcaps, ground-truth CSV), correlation engine (support/anti-evidence, twin trap), tracker (visits/patterns/edges/trackability), scoring, both web portals |
+| `wifiscanner/cli.py` | argparse surface, 22 commands, guardrails |
+| `wifiscanner/wcrypto.py` | stdlib crypto core for `wpa-lab`: AES/CCM/GCM/CMAC/KW/RC4/PBKDF2 pinned to published vectors |
+| `wifiscanner/wpalab.py` | WPA/WPA2/WPA3 decryption lab: capture analysis, MIC key verify, authorised decrypt, web portal |
+| `wifiscanner/devlab.py` | shared lab store + MAC-randomization lab + device-tracking lab |
+| `wifiscanner/hidmon.py` | stealth-detection lab: telemetry scenario, signal engine, alerts, hunt, web |
+| `wifiscanner/autoresp.py` | response lab: rule engine, 4 modes, approvals, rollback, audit trail |
+| `wifiscanner/scanlab.py` | scan/scope lab: virtual estate, job engine (concurrency + rate limiting), scope sentinel, alerts, web |
+| `wifiscanner/credlab.py` | credential security lab: fixture generator (synthetic identities), plaintext/TLS dissector, detector alerts, report export, web |
+| `wifiscanner/privlab.py` | privacy lab: synthetic MAC-rotation observation logs, clustering/correlation engine, exposure + scrub report, scope sentinel, web |
+| `wifiscanner/rflab.py` | RF resilience lab: metric engine, interferer simulator (start/stop/reset/intensity caps), detector + incident reports, web |
+| `wifiscanner/hsaudit.py` | handshake/password-audit lab: tiered synthetic credential+capture generation, MIC-driven offline audit with timing, three-state teaching, web |
 
 ---
 
@@ -481,6 +506,387 @@ Typical use: `inject --mode ids-selftest` in CI; then on your own lab AP
 protected, 1 = client was kicked (fix 802.11w), 3 = inconclusive. The same
 verdict applies to `--mode deauth --frame-type both`, which additionally
 exercises the full deauth/disassoc path at a configurable (capped) burst size.
+
+### `lab` — captive-portal phishing awareness lab (training simulation)
+
+A **fully local** teaching rig for the "evil captive portal" lesson. Running
+`wifiscanner lab` starts a small server (localhost by default, zero extra
+dependencies) and prints two URLs:
+
+* **Student portal** `http://localhost:8808/` — a realistic-looking Wi-Fi
+  sign-in page pretending to be `--ssid` (default `CampusNet-Guest`),
+  complete with captive-DNS behaviour (every unknown URL lands back on the
+  login form). Students either use the printed **synthetic roster**
+  (`traineeNN@lab.example` + generated passphrases — RFC 2606 domain, tied
+  to no real service) or type whatever test credentials the exercise allows.
+* **Instructor dashboard** `http://localhost:8808/i/<token>` — the token is
+  random per run (fix it with `--instructor-token`) and the portal never
+  links to it. It auto-refreshes and shows the **attack flow funnel**
+  (portal views → unique clients → submissions → captured roster accounts →
+  fastest view→submit time), the **captured TEST values** exactly as typed
+  (this table *is* what a real attacker's log would contain), per-account
+  roster status, a timestamped **detection event log**, and a **Reset**
+  button that wipes submissions/events between exercises.
+
+Flow: a submission goes to `/submit`, is recorded with verdict
+`roster-match` / `roster-account-wrong-secret` / `off-roster` in the
+owner-only (0600) SQLite training DB (`--db`), fires a `lab capture #N`
+console line plus a `credential-submit` event (the detection/logging part),
+and lands the student on an instant **debrief page**. Linked from there:
+
+* `/indicators` — seven tells that expose the fake portal (no HTTPS padlock,
+  bare-IP host, uninvited appearance, template branding, over-asking,
+  pressure language, no out-of-band verification), two hidden
+  `view-source:` markers to hunt, and pointers to the RF side
+  (`ids`, `ids --learn`, `scan` rogue rows, `inject --mode ids-selftest`).
+* `/compare` — legitimate reference portal (`/legit`) vs the simulated
+  phishing portal, side by side: address bar, transport, arrival path,
+  branding, data requested, verifiability.
+* `/learn` — the attacker's view: the full kill chain (deauth kick → evil
+  twin → captive DNS → fake portal → captured credentials → reuse), what one
+  submission hands over (password verbatim, account enumeration, IP, UA
+  fingerprint, timestamps), and the defender's checklist.
+
+Hard scope rules, enforced in code: nothing in `lab` performs RF work,
+clones an AP, intercepts DNS, decrypts, or contacts any real authentication
+system; the only "valid" credentials that can ever exist are the synthetic
+roster entries. Everything else is `--bind`/`--port` (default
+`127.0.0.1:8808`; `--bind 0.0.0.0` for a classroom LAN you control),
+`--duration N` auto-stop, `-o DIR` to export `lab_accounts.csv` /
+`lab_attempts.csv` / `lab_events.csv` / `lab.json` (0600) on exit, and:
+
+```
+wifiscanner lab --self-test    # 12-check offline proof, no port stays open
+wifiscanner lab --reset --yes                     # wipe submissions (roster kept)
+wifiscanner lab --reset --yes --rotate-roster     # + fresh synthetic credentials
+```
+
+### `wpa-lab` — WPA/WPA2/WPA3 decryption laboratory
+
+An offline, hands-on crypto lesson built on **real laboratory captures and
+real verified cryptography** — not a simulation of one. Six actions:
+
+```
+wifiscanner wpa-lab make-fixture lesson.pcap --ssid ClassNet-7 \
+    --password 'lab-secret-99!'      # instructor: build the lab capture
+wifiscanner wpa-lab inventory lesson.pcap        # ex.1: frame/handshake map
+wifiscanner wpa-lab try lesson.pcap --ssid ClassNet-7 --password wrong
+                                                 # ex.2: watch the MIC reject it
+wifiscanner wpa-lab try lesson.pcap --ssid ClassNet-7 --password 'lab-secret-99!'
+                                                 # ex.3: verify + decrypt
+wifiscanner wpa-lab decrypt lesson.pcap --ssid ClassNet-7 \
+    --password 'lab-secret-99!' -o out           # full export bundle
+wifiscanner wpa-lab web lesson.pcap --ssid ClassNet-7 --password '...'
+                                                 # student + instructor web UI
+wifiscanner wpa-lab exercises                    # the guided worksheet
+```
+
+Under the hood, sharing the lab's capture format with any real 802.11
+monitor capture (`wifiscanner capture`, tcpdump `-I`, Wireshark dumps;
+Radiotap or raw 802.11 pcaps):
+
+* **pipelines**: stdlib pcap reader → 802.11 dissection (DS flags, QoS/TID,
+  protected bit, seq) → RSN/WPA IE parsing → generation labels
+  (WPA / WPA2 / WPA2-Ent / WPA3-SAE / transition / OPEN) → EAPOL-Key
+  message classification (M1–M4, nonces, replay counters, MIC, encrypted
+  key data).
+* **authorised decryption**: `LabKey` accepts a passphrase (+SSID → PBKDF2
+  PMK), a raw 64-hex PSK, or a raw PMK (`--pmk` — the path for WPA3-SAE
+  captures, where SAE removes the offline passphrase equivalence).
+  `derive_ptk` builds KCK/KEK/TK with the 802.11 PRF; the candidate is
+  verified by recomputing the message-2/4 MIC before any data frame is
+  touched. Verified sessions decrypt CCMP-128/CCMP-256 (AES-CCM) and
+  GCMP (AES-GCM) data frames; the GTK is recovered from the KEK-wrapped
+  (AES-KWP, RFC 5649) message-3 key data so broadcast/multicast frames
+  (ARP etc.) decrypt too.
+* **before vs after**: without a key, rows carry only MACs/sizes/timing;
+  after, the summariser spells out IPv4 flows — ARP requests, DNS names,
+  HTTP request lines and response bodies, ICMP. `decrypt -o DIR` writes
+  `wpa_lab_frames.csv`, `wpa_lab_decrypted.pcap` (Ethernet — drop straight
+  into Wireshark, exercise 6), `wpa_lab.json` and `wpa_lab_report.md`
+  (owner-only 0600).
+* **failure cases are the curriculum**: wrong key → MIC mismatch
+  (`try` exits 1); capture without a handshake → even the correct key
+  cannot form a PTK (`try` exits 3 with the teaching note);
+  incomplete handshake (M1 only) → explicit `no-handshake` verdict;
+  corrupt/truncated frames → `decrypt-failed` rows. TKIP bodies are
+  detected and *explained*, not decrypted (its design flaws are the
+  lesson); WPA3 SAE exchanges are detected and annotated, with `--pmk`
+  as the authorised decryption path.
+* **crypto trust**: every primitive is verified in the test suite against
+  published vectors — AES-128/192/256 (FIPS-197), CCM (RFC 3610), GCM
+  (NIST), CMAC (RFC 4493), KW (RFC 3394), RC4, PBKDF2/PMK (RFC 6070 plus
+  the canonical `password`/`IEEE` 802.11 vector). No `pip install` needed.
+* **web mode** (`wpa-lab web`): student portal at `/` (capture facts, key
+  submission with MIC-verified result pages, before/after frame list,
+  guided exercise sheet) and a token-gated instructor dashboard at
+  `/i/<token>` (page-view/key-attempt detection log, funnel, one-click
+  authorised decrypt with the loaded lab keys, session reset). Attempts
+  persist to a 0600 SQLite DB (`--db`, `:memory:` to opt out). Binds
+  localhost by default; `--bind 0.0.0.0` for a classroom LAN you control.
+
+### `mac-lab` — MAC randomization & deanonymization laboratory
+
+An offline, instructor-controlled laboratory for the question *"if my phone
+rotates its address, can anyone tell it's still me?"* — answered with a
+synthetic multi-sensor dataset and an evidence engine whose reasoning is
+**fully exposed** (support, anti-evidence, graduated confidence, and the
+trap that proves why fingerprint ≠ identity). Seven actions:
+
+```
+wifiscanner mac-lab make-dataset macds --seed 8 --fresh
+                                          # instructor: build the dataset
+wifiscanner mac-lab inventory macds       # every observed MAC: type,
+                                          #   fingerprint, probed SSIDs
+wifiscanner mac-lab correlate macds       # pairwise evidence matrix +
+                                          #   engine clusters (hypotheses)
+wifiscanner mac-lab explain macds M1 M2   # full reasoning for one pair
+cat answer.json | wifiscanner mac-lab score macds --submit -
+wifiscanner mac-lab web macds             # student portal + instructor dash
+wifiscanner mac-lab exercises             # the guided worksheet
+```
+
+* **dataset**: `make-dataset` writes `sensor-<name>.pcap` files (Radiotap,
+  probe-requests only), a `manifest.json`, and an instructor-only
+  `ground-truth.csv` (0600, never rendered to students). The scenario: a
+  phone rotating between three randomized MACs with same-day hand-off
+  chains (30–150 s), two **twin decoys** sharing fingerprint *and* probed
+  SSID sets but visible simultaneously at different sensors, a stable
+  laptop control, a cadence-telling IoT badge, and grey-zone background.
+* **correlation engine**: +40 identical IE fingerprint · +25×Jaccard on
+  probed SSIDs · +15 session-in/silence-out rotation hand-off (2 s..180 s)
+  · +5 RSSI proximity · +5 cadence · +5 both-randomized — versus hard
+  anti-evidence (−70/−100 simultaneous presence ⇒ provably distinct).
+  A fingerprint-only match can **never** climb past `possible` (same-model
+  coincidence); every verdict is a labelled hypothesis
+  (`low / possible / likely / high / different`) with named caveats.
+* **scoring**: correct merges earn, wrong merges cost, and merging the
+  twins explicitly triggers the twin-trap feedback (simultaneous presence
+  is proof of two devices). Success and failure walks are equally real.
+* **web mode**: student pages (MAC roster, evidence matrix, clustering
+  quiz, worksheet) + token-gated instructor dashboard (`/i/<token>`, ground
+  truth table, detection-log of attempts, funnel, reset, and **one-click
+  🎲 regenerate** which rebuilds a fresh dataset with `seed+1` in place).
+
+### `track-lab` — long-term device tracking & privacy laboratory
+
+Two weeks of synthetic sightings answer *"how much can a collector learn
+from a persistent identifier + time?"* — and *"what breaks it?"*:
+
+```
+wifiscanner track-lab make-dataset tds --seed 9 --fresh   # instructor
+wifiscanner track-lab inventory tds      # who is most present? visits/days
+wifiscanner track-lab history tds --mac 3C:5A:B4:71:00:42
+wifiscanner track-lab patterns tds --mac 3C:5A:B4:71:00:42
+                                         # hour heatmap, weekdays, dwell,
+                                         # movement edges + trackability
+wifiscanner track-lab compare tds --since 2d
+                                         # short window vs full retention
+wifiscanner track-lab score tds --answers quiz.json
+wifiscanner track-lab web tds --port 8822
+wifiscanner track-lab exercises
+```
+
+* **scenario**: Student-A keeps a predictable weekday routine
+  (`lab-north → canteen → lab-south`); Decoy-A′ shares Student-A's OUI and
+  morning window but lives in the corridor only (the false-positive trap);
+  Visitor-B rotates a fresh MAC every single visit — the privacy defence,
+  watched *working*; Staff-IoT badges a fixed daily loop; ~100 one-shot
+  background devices fill the grey zone. All synthetic; lab grid only.
+* **engine**: visit sessionization (3-min gap split), per-MAC weekday/hour
+  heatmaps, dwell minutes per sensor, movement edges (same-day transitions
+  ≤6 h), and a plain-words trackability verdict keyed on persistence.
+* **the retention lesson**: `compare --since 2d` shows the 2-day window
+  supports presence only — the same database with a longer retention
+  reconstructs the routine. The dataset didn't change; *retention* did.
+* **quiz + traps**: scoring credits the correct identity and punishes the
+  same-OUI decoy attribution with the specific rule it violates
+  (`Same-OUI ≠ same owner`). `web` mirrors everything with a student
+  portal and instructor dashboard (ground truth, attempt log, one-click
+  reset **and dataset regeneration**).
+
+### `stealth-lab` — hidden monitoring & stealth detection laboratory
+
+The question is *"how would you even notice a monitor that hides?"*
+The lab synthesises four days of host telemetry for `lab-ws-07` — process
+snapshots, connection tables, file events, service registry, auth.log — and
+hides an implant inside. Students get exactly what a normal administrator
+sees at any chosen tick; an instructor console advances time.
+
+```
+wifiscanner stealth-lab make-scenario scn --seed 10 --fresh  # instructor
+wifiscanner stealth-lab telemetry scn --kind procs --day 3
+wifiscanner stealth-lab hunt scn          # league of suspects + signals
+wifiscanner stealth-lab explain scn IMPLANT
+wifiscanner stealth-lab compare scn       # authorised vs covert monitor
+wifiscanner stealth-lab alerts scn        # normal → suspicious transitions
+wifiscanner stealth-lab score scn --answers ans.json
+wifiscanner stealth-lab web scn --port 8823
+```
+
+* **beats** (seeded, deterministic): install → 6-hourly keepalives → the
+  night **flip** (cadence tightens ~40×, CPU spikes 22:00–06:00) →
+  **concealment** (process vanishes from ps while sockets keep flowing —
+  the ps-vs-ss discrepancy, plus an auth.log black hole over its active
+  window) → **respawn/rename** on the same C2 → **unlink-while-running**
+  of the staging file (`ls` sees nothing; the fd does).
+* **signals are first-class**: name-mimicry (40), unowned package (15),
+  concealment (60), C2 egress (25), cadence flip (20), night delta (20),
+  respawn (15), hidden staging (10), unlink (30), audit gap (20). The IT
+  monitor is course-provided and *must not* be shot — the false-accusation
+  branch is scored.
+* **visibility table** on the home page makes explicit which instrument
+  stealth can blind and which one betrays it.
+
+### `response-lab` — automatic (offensive) response laboratory
+
+An IDS event stream (deterministic per seed) hits **designated lab test
+devices**: a deauth flood, a port sweep, an auth brute-force, then low-exfil
+beacons from `TEST-ATTACK-01`; scheduled sweeps from the organisation's
+own `IT-SCAN-01`; ambient below-threshold chatter from `NEIGHBOR-77`.
+Policies R1–R5 record/alert/block; **R6 (aggressive) ships disabled**.
+
+```
+wifiscanner response-lab cast                     # designated devices
+wifiscanner response-lab rules                    # the rulebook
+wifiscanner response-lab simulate --mode dry-run  # what WOULD happen
+wifiscanner response-lab simulate --mode auto
+wifiscanner response-lab simulate --mode auto --enable-rule R6 \
+    --clear-allowlist                             # friendly fire, on purpose
+wifiscanner response-lab simulate --mode approval
+wifiscanner response-lab score --answers ans.json
+wifiscanner response-lab web --port 8824          # portal + console
+```
+
+* **modes**: `dry-run` logs decisions and `would-block` results without
+  touching state (and never consumes history); `approval` queues actions
+  for an instructor click (approve/deny); `auto` executes into the
+  simulated firewall table immediately; `manual` records only.
+* **false-positive engineering**: enable R6 with an empty allowlist and the
+  lab blocks its own IT scanner at tick 4. Reinstate the allowlist, roll
+  the block back, re-run — the audit makes the before/after obvious.
+* **safety scope**: responses act ONLY on registered lab devices; every
+  other source is answered `out-of-scope` at decision time. The firewall
+  is a dict in this process — nothing real is ever touched.
+* **auditability**: every action leaves a detect → decision → response →
+  result chain, and every rollback its own entry. Manual vs auto runtimes,
+  the helper block you must not write, and the approval choreography are
+  the worksheet exercises.
+
+### `handshake-lab` — WPA handshake capture & password-auditing laboratory
+
+`handshake-lab` teaches, with real cryptographic operations, why Wi-Fi
+password strength matters.  The instructor generates a dataset of lab
+captures (4-way handshakes plus a small encrypted tail, all over the
+lab-only SSID `LabHS3-Intro` and the `02:1a:c3` MAC block — nothing is
+transmitted or observed) and three difficulty tiers of lab-minted
+wordlists.  Students validate the capture, run an offline MIC-driven
+dictionary audit with measured timing and guess rates, and finish by
+*authenticating* — proving knowledge of the credential by decrypting a
+post-handshake frame.  The easy and medium tiers fall quickly; the
+expert tier's strong credential is not in the list at all, so the audit
+exhausts: that failure is the intended lesson.  Quiz + exercises +
+scoring; instructor console (:8829) rotates credentials/captures, resets
+progress, or destroys the dataset outright.
+
+```
+wifi-scanner handshake-lab make-dataset /tmp/hs --seed 3 --fresh
+wifi-scanner handshake-lab inventory --db /tmp/hs
+wifi-scanner handshake-lab analyze --db /tmp/hs --tier easy
+wifi-scanner handshake-lab audit --db /tmp/hs --tier easy       # found fast
+wifi-scanner handshake-lab audit --db /tmp/hs --tier expert     # resists
+wifi-scanner handshake-lab compare --db /tmp/hs                 # three tiers
+wifi-scanner handshake-lab authenticate --db /tmp/hs --tier easy \
+    --password coffee-shop
+wifi-scanner handshake-lab web --db /tmp/hs --instructor-token tok
+```
+
+### `priv-lab` — wireless privacy & MAC-randomization laboratory
+
+`priv-lab` teaches where MAC randomization actually ends.  An
+instructor-generated dataset of *synthetic* observations (every MAC sits
+in the locally-administered `02:1a:b4` block — no real radio or vendor
+identity is involved) is loaded into a web console (`:8827`) where
+students see raw probe logs, run the correlation engine, and learn that
+identical probe-request fingerprints and daily routines re-cluster
+rotated MACs anyway.  The privacy page quantifies PNO-list leakage
+before/after a scrub, the what-if simulator scores configuration knobs,
+and a scope sentinel refuses — with a logged alert — any attempt to
+correlate the lab's reference AP.
+
+```
+wifi-scanner priv-lab make-dataset /tmp/priv --seed 14 --devices 10 --fresh
+wifi-scanner priv-lab inventory --db /tmp/priv
+wifi-scanner priv-lab correlate --db /tmp/priv        # clusters + confidence
+wifi-scanner priv-lab correlate --db /tmp/priv --target LAB-DEV-01
+                                                     # refused (scope)
+wifi-scanner priv-lab compare --db /tmp/priv          # scrub before/after
+wifi-scanner priv-lab score --answers answers.json
+wifi-scanner priv-lab web --db /tmp/priv --instructor-token tok
+```
+
+### `rf-lab` — RF interference & Wi-Fi resilience laboratory
+
+`rf-lab` is a simulation-only interference lab: a deterministic engine
+models channel utilisation, SNR, loss, latency and goodput for three lab
+APs on channels 1/6/11.  The instructor starts one of four interferer
+profiles (microwave, Bluetooth hopper, 2.4 GHz cordless, wideband chaos)
+at a hard-capped intensity, students watch sparklines degrade, run the
+detector (which classifies the interferer from its signature as a
+passive monitor would), compare before/after reports, and pass the
+resilience exercise by re-channeling the hit AP onto a non-overlapping
+quiet channel.  No RF is emitted — the lesson is in the numbers.
+
+```
+wifi-scanner rf-lab baseline                          # healthy estate
+wifi-scanner rf-lab inject --interferer microwave --intensity 70
+wifi-scanner rf-lab compare --interferer cordless --intensity 90
+wifi-scanner rf-lab investigate --interferer bluetooth --intensity 80
+wifi-scanner rf-lab resilience --ap LAB-AP-3 --channel 1
+wifi-scanner rf-lab web --instructor-token tok        # console :8828
+```
+
+### `scan-lab` — large-scale scanning & scope-control laboratory
+
+`scan-lab` is an instructor-controlled scanning lab against a *virtual*
+estate: generated inventory on `10.77.*` (services, online flags,
+duplicate-IP conflicts), a simulated scan engine with real concurrency +
+rate limiting and per-job progress, and a scope sentinel that refuses
+unlisted or out-of-subnet targets **before probing** and raises a visible
+alert on every attempt. Nothing on wire reaches anything real.
+
+```
+wifi-scanner scan-lab web --db /tmp/estate           # console :8825
+wifi-scanner scan-lab make-dataset /tmp/estate --seed 12 --size 80
+wifi-scanner scan-lab inventory --db /tmp/estate     # census + duplicate IPs
+wifi-scanner scan-lab scan --db /tmp/estate \
+    --targets '[10.77.0.*,192.168.1.1]'              # out-of-scope refused
+wifi-scanner scan-lab compare --db /tmp/estate       # targeted vs sweep
+wifi-scanner scan-lab score --answers ...
+```
+
+On the web console: run jobs from the form, watch live progress + scope
+refusals, export CSV, take the scored quiz; the instructor page
+(`/i/<token>`) offers estate expand, full reset and regenerate.
+
+### `cred-lab` — credential & session security laboratory
+
+`cred-lab` uses a lab-generated capture that contains both versions of
+the same synthetic day: six plaintext auth surfaces (HTTP Basic via
+base64, form POST, FTP USER/PASS, Telnet keystrokes, SNMPv1 community
+strings, replayable session cookies) dissected and counted — and the
+same identities over TLS where only SNI survives. Every identity is
+lab-minted (`LAB-STUDENT-*`); the instructor can rotate or destroy them.
+
+```
+wifi-scanner cred-lab make-fixture /tmp/lesson.pcap --students 6
+wifi-scanner cred-lab dissect  /tmp/lesson.pcap      # census + exposure count
+wifi-scanner cred-lab exposures /tmp/lesson.pcap     # plaintext table
+wifi-scanner cred-lab tls /tmp/lesson.pcap           # what TLS hides
+wifi-scanner cred-lab alerts /tmp/lesson.pcap        # insecure-auth findings
+wifi-scanner cred-lab report /tmp/lesson.pcap -o /tmp/bundle
+wifi-scanner cred-lab web /tmp/lesson.pcap --instructor-token tok
+```
 
 ### `db` — history-database maintenance (privacy controls)
 `--report` (permissions/size/retention/table counts + world-readable warning),
@@ -865,8 +1271,44 @@ python3 tests/make_fixture.py         # builds tests/fixture.pcap (288 frames:
                                       # 5 BSS incl. an evil twin)
 python3 tests/test_wifiscanner.py     # core suite, no radio, no root
 python3 tests/test_injection.py       # injection gates/builders/selftest
-# => 117 tests total, all offline; nothing transmits in the test suite
+python3 tests/test_lab.py             # phishing-lab: roster/store/HTTP/API/reset
+python3 tests/test_wpalab.py          # WPA lab: crypto vectors → decrypt → web
+python3 tests/test_devlab.py          # mac-lab + track-lab: datasets,
+                                      #  correlation engine, tracker, traps,
+                                      #  scoring, both web UIs, CLI smoke
+python3 tests/test_solabs.py          # stealth-lab: telemetry scenario,
+                                      #  signal engine, concealment beats,
+                                      #  quiz; response-lab: rules, modes
+                                      #  (dry-run/approval/auto/manual),
+                                      #  FP story, rollback, audit chain
+python3 tests/test_biglabs.py         # scan-lab: estate, sentinel scope
+                                      #  refusals, rate limit, concurrency,
+                                      #  cancel, web; cred-lab: six
+                                      #  plaintext protocols exposed,
+                                      #  TLS leg proven opaque, web +
+                                      #  identity regeneration
+python3 tests/test_privrf.py          # priv-lab: rotation clustering,
+                                      #  scope refusal, scrub impact,
+                                      #  what-if config; rf-lab: 4
+                                      #  interferers classified, non-
+                                      #  overlap resilience, instructor
+                                      #  caps/audit, web
+python3 tests/test_hsaudit.py         # handshake-lab: real 4-way capture
+                                      #  validation, tiered wordlists,
+                                      #  audit timing, resist case,
+                                      #  three-state distinction, web +
+                                      #  instructor regen/destroy
+# => 246 tests total, all offline; nothing transmits in the test suite
 ```
+
+The lab tests additionally cover: synthetic-roster determinism/domain/bounds;
+LabStore verdict classification (`roster-match` / wrong-secret / off-roster),
+funnel counters, dwell time, reset-keeps-roster and rotate-roster semantics;
+the full HTTP path on an ephemeral loopback port (portal render, captive
+redirect, submission → debrief without echoing the secret, instructor API
+auth, dashboard stealth without the token, dashboard reset); POST size caps;
+0600 owner-only export files; and CLI guards (`lab --reset` needs `--yes`,
+`lab --self-test` passes 12/12).
 
 Coverage: RF math round-trips; randomized/multicast MAC rules; OUI; score
 ordering + WPS/TKIP penalties; station accounting idempotence; source merge
@@ -964,6 +1406,121 @@ that feature is not getting merged, here or in forks.
 
 ## 20. Changelog
 
+* **v4.1.0** — **`handshake-lab`**: a WPA handshake capture &
+  password-auditing laboratory. The instructor generates *real* 4-way
+  handshakes (same vector-verified crypto as the decryptor) for a lab
+  SSID on the lab-only MAC block, plus tiered lab wordlists
+  (easy=weak-at-top, medium=weak-buried, expert=strong-outside-list).
+  `analyze` proves capture validity; `audit` runs offline MIC checks
+  over the instructor's wordlist with live timing (verified: easy found
+  in 0.04 s, expert exhausts 420 candidates and *resists*);
+  `authenticate` closes the loop by decrypting a post-handshake frame —
+  the pedagogical CAPTURED≠AUDITED≠AUTHENTICATED distinction. Web
+  console on :8829, instructor regenerate/reset/destroy, quiz 100/0.
+  **246 tests**.
+* **v4.0.0** — two more offline, instructor-controlled laboratories:
+  **`priv-lab`** (wireless privacy & MAC randomization) — every
+  identifier is synthetic; the engine clusters rotated MACs into identity
+  tracks from probe-request fingerprints, routines and RSSI trends, the
+  privacy page quantifies how a PNO-list scrub collapses leakage
+  (349→0 SSIDs in the demo), a what-if simulator scores config knobs
+  (scrub + IE randomize + irregular timing → confidence 0.10), and a
+  scope sentinel refuses any correlation against the lab's own reference
+  AP with loud, logged alerts; **`rf-lab`** (RF interference &
+  resilience) — a deterministic metric engine models channel utilisation,
+  SNR, loss, latency and throughput for three lab APs on channels
+  1/6/11; the instructor starts/stops/resets/caps four interferer
+  profiles, the passive-monitor detector classifies each from its
+  signature, the compare command proves before/after deltas
+  (ch11 −19.8% goodput under microwave@80 while ch1 stays flat), and the
+  rechannel exercise moves the hit AP to a quiet channel with a
+  measurable recovery score. No RF is generated or transmitted —
+  everything is modelled. **232 tests**.
+* **v3.0.0** — two more offline, instructor-controlled laboratories:
+  **`scan-lab`** (large-scale scanning & scope control) — a virtual lab
+  estate (instructor-generated, 10.77.* only), a simulated scan engine
+  with real concurrency + rate limiting and a live progress chart, a scope
+  sentinel that *refuses unlisted/out-of-subnet targets before probing*
+  and alerts on every attempt, duplicate-IP inventory conflicts to find,
+  targeted-vs-uncontrolled twin numbers, CSV results export, and an
+  instructor console with expand/reset/regenerate; **`cred-lab`**
+  (credential & session security) — one capture, two versions of the same
+  day: six plaintext auth surfaces (HTTP Basic via base64, form POST, FTP
+  USER/PASS, Telnet keystrokes, SNMPv1 community, replayable session
+  cookies) dissected and counted, then the identical identities over TLS
+  where only SNI survives; detector alerts for insecure-auth protocols, a
+  report bundle (CSV+markdown), and rotate/destroy identity controls for
+  the instructor. All credentials synthetic, all traffic lab-generated.
+  **210 tests**.
+* **v2.9.0** — two more offline, instructor-controlled laboratories:
+  **`stealth-lab`** (hidden monitoring & stealth detection) — a seeded
+  4-day host-telemetry scenario (process/connection/file/auth.log/service
+  tables) with a concealed implant that installs, flips active at night,
+  vanishes from ps (sockets keep talking — the ps-vs-ss lesson), wipes its
+  auth.log window, respawns under a second kernel-lookalike name, and
+  unlinks its staging file while running; an explainable signal engine
+  (concealment 60 > name-mimic 40 > unlink 30 > cadence-flip 20 > …),
+  behaviour-change alerts, a normal-vs-covert comparison page starring the
+  authorised IT monitor students must NOT accuse, a scored five-finding
+  hunt, and a token-gated instructor console with tick control + reset +
+  regenerate; **`response-lab`** (automatic/offensive response) — a seeded
+  IDS event stream aimed at designated lab test devices (deauth flood,
+  port sweep, brute force, low-and-slow exfil), a rulebook (R1-R6; the
+  aggressive R6 ships DISABLED), response modes dry-run / approval / auto /
+  manual, a simulated firewall containing blocks, an instructor approval
+  queue, first-class rollback, and a full detect->decide->respond->result
+  audit trail with true/false-positive metrics (the friendly-fire trap:
+  R6 + empty allowlist blocks your own IT scanner). Scope is enforced at
+  decision time — policies always refuse non-designated sources.
+  **188 tests**.
+* **v2.8.0** — two more offline, instructor-controlled laboratories:
+  **`mac-lab`** (MAC randomization & deanonymization) — an evidence engine
+  that reasons out loud (+40 fingerprint · +25×Jaccard probed SSIDs · +15
+  rotation hand-offs · RSSI/cadence/addr-type), hard anti-evidence for
+  simultaneous presence (the twin decoys), a fingerprint-only cap so
+  same-model coincidence can never look like identity, hypothesis-labelled
+  clusters, a scored clustering exercise, and a token-gated web portal with
+  instructor ground-truth dashboard and one-click **dataset regeneration**;
+  **`track-lab`** (long-term device tracking) — visit sessionization,
+  weekday/hour heatmaps, dwell, movement edges, trackability verdicts, the
+  short-window-vs-full-retention contrast (`compare --since 2d`), a
+  same-OUI decoy attribution trap scored as a false positive, a daily MAC
+  rotator demonstrating the privacy defence working, and a privacy-brief
+  page. Both labs: synthetic devices only, offline only, ground truth
+  instructor-side (0600), attempts logged (SQLite 0600), and one-click
+  reset/regenerate. **166 tests**.
+* **v2.7.0** — `wpa-lab`: the **WPA/WPA2/WPA3 decryption laboratory**.
+  Real capture pipeline (stdlib pcap/Radiotap/802.11/RSN/EAPOL parsing),
+  offline key verification against the handshake MIC, and authorised
+  decryption with laboratory key material: passphrase (PBKDF2), raw PSK,
+  or raw PMK (the WPA3-SAE path). CCMP-128/256 and GCMP frame decryption,
+  AES-KWP-wrapped GTK recovery so broadcast ARP decrypts too, before/after
+  visibility reports, Ethernet `decrypted.pcap` export, failure cases as
+  first-class output (wrong key = MIC mismatch, rc 1; missing handshake =
+  rc 3 with the teaching note), a guided six-exercise worksheet, a
+  `make-fixture` generator that emits cryptographically real lab captures
+  (no radio required), and a token-gated student/instructor **web lab**
+  with attempt detection logging and one-click authorised unlock. The
+  crypto core is stdlib-only and pinned to published vectors (FIPS-197,
+  RFC 3610/4493/3394, NIST GCM, RFC 6070 + the canonical 802.11 PMK
+  vector). **143 tests**.
+* **v2.6.0** — `lab`: a **captive-portal phishing AWARENESS lab**, fully
+  local and RF-free. `wifiscanner lab` serves a realistic fake Wi-Fi login
+  portal (captive redirect on unknown URLs included) plus a token-gated,
+  auto-refreshing **instructor dashboard**: attack-flow funnel, captured
+  TEST values, roster status, timestamped detection log, one-click reset.
+  Training uses only a generated roster of synthetic accounts
+  (`traineeNN@lab.example`); verdicts classify roster-match vs wrong-secret
+  vs off-roster attempts; a submission triggers an instant debrief page and
+  student-facing `/indicators`, `/compare` (legitimate vs phishing) and
+  `/learn` (attacker's view + defender checklist) pages that cross-reference
+  the IDS side for the RF hops. Everything persists to a 0600 SQLite
+  training DB with `--reset --yes` / `--rotate-roster` cleanup and `-o`
+  CSV/JSON export; `--self-test` proves all 12 lab checks offline. The
+  binding default is localhost; nothing in `lab` transmits, clones an AP,
+  harvests real credentials or contacts a real authentication service.
+  **126 tests**.
+
 * **v2.5.0** — Evil-Twin / rogue-AP *detection drill* (`inject --mode
   evil-twin`). Beacons a network name YOU own from a fresh spoofed BSSID for
   a hard-capped, self-terminating window (`--ssid`, `--security {open,wpa2}`,
@@ -974,7 +1531,9 @@ that feature is not getting merged, here or in forks.
   traffic; it exists purely to verify that `ids` unknown-bss warden alerts
   and `scan` same-SSID/open-clone rogue heuristics fire. The drill is proven
   end-to-end to trip both detectors. There is no functional rogue AP,
-  credential capture, karma or jamming in the codebase. **117 tests**.
+  credential capture, karma or jamming in the codebase's RF path (v2.6.0's
+  separate, loopback-only `lab` training simulation is documented in its
+  own section above). **117 tests**.
 * **v2.4.0** — full deauthentication/disassociation test + IDS subtype fix.
   `inject --mode deauth` sends a bounded, one-shot, **unicast** burst of
   deauth and/or disassociation frames (`--frame-type {deauth,disassoc,both}`,
