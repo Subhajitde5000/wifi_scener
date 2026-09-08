@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="wifiscanner",
-    version="2.2.0",
+    version="2.5.0",
     description="Advanced passive Wi-Fi survey, client-attribution and CSV export engine",
     packages=find_packages(include=["wifiscanner", "wifiscanner.*"]),
     python_requires=">=3.8",

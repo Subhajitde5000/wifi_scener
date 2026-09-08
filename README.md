@@ -5,8 +5,8 @@ positioning · raw capture · cleartext-traffic audit · wireless IDS ·
 hardening reports · 802.11 frame anatomy — one terminal tool, everything in
 CSV/JSON/HTML.**
 
-Version 2.2.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
-dependencies · 100% receive-only.
+Version 2.5.0 · Python ≥ 3.8 · Linux/macOS/Windows · zero mandatory
+dependencies · receive-only except for one consent-gated defensive self-test.
 
 ```
  __      __.__  _____.__    _________
@@ -49,8 +49,30 @@ dependencies · 100% receive-only.
 **It is** a professional, passive RF-intelligence and network-ownership
 toolkit for *your* airspace: it listens to frames already broadcast, reads
 your own router's association table, and analyses captures you legally hold.
-Every capability is receive-only: it never transmits, injects, deauthenticates,
-joins, clones, cracks or decrypts anything.
+Every survey, IDS, audit and history feature is receive-only: it never joins
+a network, clones an AP, cracks a key or decrypts anything.
+
+There is exactly **one** transmitting command, `inject`, and it is not an
+attack tool — it is a *self-test rig for your own defences*. It answers the
+questions passive listening cannot: *"do my IDS sensors actually hear the
+channels they claim to?"* (canary markers); *"does enabling PMF/802.11w on my
+router really stop deauth kicks?"* (the bounded `pmf-test`); *"can a
+deauthentication / disassociation burst knock one of my own clients off?"*
+(the bounded, unicast `deauth` test); and *"does my IDS/warden actually catch
+an Evil Twin beaconing my SSID?"* (the `evil-twin` **beacon-only** drill).
+The evil-twin drill transmits beacons that advertise a network name you own
+from a fresh spoofed BSSID for a few, capped seconds — but it has **no
+probe-response, authentication, association, DHCP or data path**, so the
+result is a radio that is *visible as a fake AP yet cannot accept a client,
+capture a handshake/credential or relay traffic*; it is a fire drill for your
+detectors, not a working rogue AP. Every transmitting mode is a dry run by
+default, requires root plus an explicit `--authorized` assertion (`--yes` for
+any frame that disconnects a client or impersonates an SSID), is hard
+rate/duration-capped per run (the small PMF probe stays below the IDS flood
+threshold; the deauth test and beacon drill are bounded, self-terminating,
+never a loop), refuses broadcast/wildcard/third-party targets, and writes an
+owner-only audit record of every frame. `ids-selftest` mode synthesises the
+attack signatures **offline, with no radio at all** and is safe in CI.
 
 **It isn't** — and never will be, whatever the use-case framing — an attack
 kit. These capabilities are **deliberately absent by design**:
@@ -58,10 +80,11 @@ kit. These capabilities are **deliberately absent by design**:
 | Not in this tool | What ships instead |
 |---|---|
 | Decrypt WPA/WPA2/WPA3 traffic | Protected frames are skipped and *counted*; `traffic` proves what leaks *without* encryption so you can fix it |
-| Force devices to disconnect (deauth) | `ids` detects deauth floods live — the signature of exactly that attack |
-| Rogue/evil-twin AP creation | `ids` + `scan` detect rogue BSSIDs and cloned SSIDs |
+| Deauth/disassoc **floods**, broadcast/wildcard kicking, loops | `ids` detects deauth *and* disassociation floods live; `inject` sends only a bounded, one-shot, **unicast** burst at a device you name — either a tiny below-threshold PMF probe (`pmf-test`) or an explicit authorised pen-test burst (`deauth`, hard-capped, `--yes` required) |
+| Working rogue/evil-twin AP (that accepts clients, captures handshakes/credentials, or relays traffic) | `ids` + `scan` detect rogue BSSIDs and cloned SSIDs; `inject --mode evil-twin` runs a **beacon-only** detection drill (a fake-looking AP that nothing can join) so you can verify those detectors fire |
 | Handshake capture for cracking | `ids` fires a **critical** alert when someone harvests handshakes against you; `frames --handshakes` explains the protocol |
-| Packet injection | No transmit path exists in the codebase; `frames` teaches the frame formats injection would abuse |
+| Unrestricted packet injection / frame replay | The only transmit path (`inject`) is consent-gated, target-restricted to your own infrastructure, fully audited, and offers nothing but canary markers, ordinary active-scan probes and bounded, logged, unicast deauth/disassoc self-tests |
+| Jamming / continuous channel flooding | Hard per-mode frame caps and a minimum inter-frame interval; every transmission is one bounded run, never a loop — sustained denial-of-service is not expressible in the CLI |
 | De-anonymising randomized MACs | Randomised addresses are *flagged* for reporting honesty, never correlated back to people |
 | Indefinite bystander tracking | `record` refuses to run unless pointed at your own network; probe sightings stay ephemeral |
 
@@ -92,6 +115,7 @@ how to close it) and `ids` (what each attack *looks like* on the wire).
 | 15 | LAN inventory (IPs, hostnames, ports, nmap integration) | `own`, `devices --lan` | no | no |
 | 16 | Live dashboard | `watch` | no | optional |
 | 17 | Structured export: 5 CSVs + JSON + HTML + Markdown | `-o --format` everywhere | no | no |
+| 18 | **Authorized** packet injection: offline IDS signature self-test (incl. disassoc-flood), active probe scan, IDS coverage canaries, bounded own-AP PMF check, bounded unicast **deauth/disassoc** test, and a **beacon-only Evil-Twin detection drill** (no serving/credential/data path) | `inject` | no (selftest) / yes (live) | yes (live only) |
 
 ---
 
@@ -239,8 +263,10 @@ python3 main.py frames tests/fixture.pcap --filter beacon
                         HTML, Markdown     devices, obs.,   hardening audit
                                            sessions, fixes,
                                            warden           frames.py
-                        cli.py (17 cmds) ──► display.py     frame anatomy
+                        cli.py (18 cmds) ──► display.py     frame anatomy
                         argparse, wiring     rich/ASCII      (educational)
+                                             inject.py  (off by default,
+                                            dry run, gated self-test TX)
 ```
 
 | Module | Responsibility |
@@ -256,9 +282,10 @@ python3 main.py frames tests/fixture.pcap --filter beacon
 | `wifiscanner/traffic.py` | cleartext dissector (DNS/HTTP/TLS-SNI/ARP/DHCP), flows, credential alerts (redacted) |
 | `wifiscanner/defense.py` | IDS Watchdog (7 detectors), hardening `audit_ap` |
 | `wifiscanner/frames.py` | frame-by-frame annotated 802.11 anatomy |
+| `wifiscanner/inject.py` | the *only* transmitter: frame builders (probe/deauth/**disassoc**/**beacon**, both directions), consent+privilege gates, hard frame/duration caps, owner-only audit CSV, offline `run_ids_selftest` (deauth + disassoc signatures), kick/PMF verdict, canary analysis, and the **beacon-only** evil-twin detection drill; dry run by default |
 | `wifiscanner/export.py` | CSV×5 / JSON / styled HTML / Markdown writers |
 | `wifiscanner/display.py` | rich tables/panels with full plain-text fallback |
-| `wifiscanner/cli.py` | argparse surface, 17 commands, guardrails |
+| `wifiscanner/cli.py` | argparse surface, 18 commands, guardrails |
 
 ---
 
@@ -419,6 +446,41 @@ selectors by IEEE registry name, PMF capable/required bits, vendor/WPS),
 LLC/SNAP ethertype, EAPOL **role + flags decoded from bytes** (key
 material never rendered). `--handshakes` prints the census: total EAPOL,
 per-BSS EAPOL, deauth/disassoc totals — counts only.
+
+### `inject` — authorized, defensive packet injection (self-test only)
+The only command that transmits. **It is a dry run by default**: without
+`--transmit` it builds frames, prints them and writes the audit trail without
+touching the radio. Every live mode needs **root + `--authorized`** (an
+assertion that you own the target or hold written test authorization); the
+deauth test additionally needs **`--yes`**. Frames are hard rate-capped
+(≤ 6 probes / 4 canaries per channel; ≤ 4 deauth frames total — below the
+IDS flood threshold of 5), spaced by a minimum interval, may only target a
+**unicast** AP+client you name, and every frame is recorded in a 0600
+`injection_audit.csv`. Floods, broadcast kicks, AP clones and replay are not
+implemented.
+
+| Mode | Purpose | Transmits? |
+|---|---|---|
+| `--mode ids-selftest` | synthesise deauth-flood, **disassociation-flood**, forced-reauth, beacon-mutation and unknown-BSS signatures **offline** and confirm the watchdog fires (also writes a pcap for `ids --pcap`) | never (no radio, no root) |
+| `--mode probe` | ordinary active scanning — the same probe requests every OS sends while scanning; `--ssid` for a directed probe, otherwise wildcard | dry run / guarded live |
+| `--mode canary` | emit a distinctive probe-request marker (`--token`, auto-generated) so you can verify each remote IDS/capture sensor logs it (grep the token) | dry run / guarded live |
+| `--mode pmf-test` | send a tiny unicast deauth burst at **one of your own clients** (`--bssid` + `--client`), then report whether the client stayed (**PMF works**) or was kicked and re-associated (**PMF missing → fix it**). The burst is capped *below* the IDS flood threshold | requires root + `--transmit --authorized --yes` |
+| `--mode deauth` | explicit authorised pen-test of a client's resilience: a bounded, one-shot, **unicast** burst of deauthentication and/or disassociation frames. `--frame-type {deauth,disassoc,both}`, `--direction {ap-to-sta,sta-to-ap}`, `--count N` (hard-capped). Observes and reports whether the client disconnected/re-associated (**vulnerable to kick**) or ignored the frames (**protected**) | requires root + `--transmit --authorized --yes` |
+| `--mode evil-twin` | **beacon-only** rogue-AP detection drill: for `--duration N` (hard-capped, self-terminating) it beacons `--ssid <YOUR-OWN-name>` from a fresh spoofed BSSID on `-c CH`, advertising `--security {open,wpa2}`, so your warden/rogue detectors have something to catch. It sends **only beacons** — no probe responses, authentication, association, DHCP or data — so no client can connect, hand over a credential or be relayed. Reports how to verify the alert | requires root + `--transmit --authorized --yes` |
+
+Every kick mode refuses broadcast/multicast or wildcard `--client`/`--bssid`
+(kicking *all* clients is an attack, not a test), never loops, and logs each
+frame with direction/reason to the 0600 audit CSV. Disassociation is the
+polite cousin of deauth (it asks an associated STA to drop the association);
+both are management frames protected by PMF/802.11w, so a client that stays
+associated has MFP correctly enforced.
+
+Typical use: `inject --mode ids-selftest` in CI; then on your own lab AP
+`sudo wifiscanner inject --mode pmf-test -i wlan0 -c 6 --bssid MY-AP-MAC
+--client MY-LAPTOP-MAC --transmit --authorized --yes` — exit 0 = PMF
+protected, 1 = client was kicked (fix 802.11w), 3 = inconclusive. The same
+verdict applies to `--mode deauth --frame-type both`, which additionally
+exercises the full deauth/disassoc path at a configurable (capped) burst size.
 
 ### `db` — history-database maintenance (privacy controls)
 `--report` (permissions/size/retention/table counts + world-readable warning),
@@ -664,8 +726,10 @@ Indoor reality: expect **room/zone-level** accuracy, metres not centimetres.
 Mechanics: per-`window` sliding counters per BSSID; per-(kind, BSSID)
 30 s cooldown so a burst = one alert; `--follow` streams alerts live;
 `-o` exports `ids_alerts.csv`. Live mode uses the same passive sniffer —
-**the watchdog has no transmit path; “detection only” is architectural,
-not rhetorical.**
+**the watchdog itself has no transmit path; "detection only" is
+architectural, not rhetorical.** (The separate `inject` command can verify
+that detection end-to-end, but it never shares state with the watchdog and
+only emits the harmless canary/self-test frames documented in §8.)
 
 ---
 
@@ -722,6 +786,44 @@ dev.assign(h=pd.to_datetime(dev.last_seen).dt.hour) \
 **Cron report:** `presence --db home.sqlite --since -24h -o reports/` daily;
 email `reports/presence_sessions.csv`.
 
+**Verify a new IDS sensor before trusting it** (deploy check / CI):
+
+```bash
+# 1) offline, no radio, no root - does THIS sensor's detection code fire?
+wifiscanner inject --mode ids-selftest -o checks/    # exit 0 = 4/4 signatures
+
+# 2) live coverage drill on YOUR own lab network - does the deployed radio
+#    actually hear every channel you assigned it?
+wifiscanner inject --mode canary -i wlan0mon --channels 1,6,11 --no-monitor-setup \
+     --transmit --authorized
+# then on each remote sensor:
+#   wifiscanner ids -i wlan0mon --follow     # or grep the token in its pcap/log
+
+# 3) does PMF actually protect your clients from deauth kicks?
+sudo wifiscanner inject --mode pmf-test -i wlan0mon -c 6 --no-monitor-setup \
+     --bssid AA:BB:CC:DD:EE:FF --client <your-test-laptop-MAC> \
+     --transmit --authorized --yes
+# exit 0 = forged deauths were IGNORED (PMF works); 1 = client was kicked
+# (set Management Frame Protection to REQUIRED and re-test); 3 = inconclusive
+
+# 4) explicit authorised deauth/disassociation pen-test of YOUR own client:
+sudo wifiscanner inject --mode deauth -i wlan0mon -c 6 --no-monitor-setup \
+     --bssid AA:BB:CC:DD:EE:FF --client <your-test-laptop-MAC> \
+     --frame-type both --direction ap-to-sta --count 10 \
+     --transmit --authorized --yes
+# bounded one-shot unicast burst; reports "KICKED" (vulnerable -> enable
+# 802.11w) or "PASS" (frames ignored). Broadcast targets are refused.
+
+# 5) Evil-Twin detection drill - does your IDS catch a rogue AP beaconing
+#    YOUR SSID? (beacon ONLY: it cannot serve clients or capture anything):
+sudo wifiscanner inject --mode evil-twin -i wlan0mon -c 6 --no-monitor-setup \
+     --ssid YourOwnSSID --security open --duration 30 \
+     --transmit --authorized --yes
+# then verify on the sensor:
+#   wifiscanner ids --db warden.sqlite -i wlan0mon   -> unknown-bss alert
+#   wifiscanner scan                                 -> clone in *_rogue_alerts.csv
+```
+
 ---
 
 ## 15. Python API
@@ -761,7 +863,9 @@ python3 tests/make_fixture.py         # builds tests/fixture.pcap (288 frames:
                                       # assoc+data+LLC/SNAP-EAPOL per client,
                                       # probe storms, a 9-frame deauth burst,
                                       # 5 BSS incl. an evil twin)
-python3 tests/test_wifiscanner.py     # 76 tests, no radio, no root
+python3 tests/test_wifiscanner.py     # core suite, no radio, no root
+python3 tests/test_injection.py       # injection gates/builders/selftest
+# => 117 tests total, all offline; nothing transmits in the test suite
 ```
 
 Coverage: RF math round-trips; randomized/multicast MAC rules; OUI; score
@@ -783,7 +887,16 @@ confirmed census, identity ranges; rogue multi-indicator scoring + warden;
 privacy: salted pseudonyms, redaction helpers, 0600 files; store retention/
 erase/anonymize/ephemeral; IDS confidence + sensitivity + persistence +
 adaptive margin; locate confidence + zone-primary display; capture `--ack`
-refusal; `db` report/prune/destructive-guard; anonymized exports**.
+refusal; `db` report/prune/destructive-guard; anonymized exports**; plus
+**injection: probe/deauth frame bytes, LAA source-MAC generation, every
+consent gate (root / --authorized / --yes) refusing the right way, broadcast-
+target rejection, hard frame caps, dry-run emits zero frames while writing
+the 0600 audit CSV, PMF pass/fail/inconclusive verdicts, canary matching, and
+the offline IDS self-test detecting every signature end-to-end through the
+CLI; disassociation-frame subtypes, the deauth/disassoc burst mode, both
+directions, the one-shot kick cap, and a regression test that the IDS counts
+disassoc floods (subtype 10) while never miscounting authentication frames
+(subtype 11)**.
 
 ---
 
@@ -830,16 +943,61 @@ assumes 20 MHz width; the OUI table ships trimmed — extend with
 
 ## 19. Legal & ethics
 
-Everything here is **receive-only** and scoped to infrastructure you own or
-explicitly authorise. Passive monitoring of public airspace is permitted in
-most jurisdictions but not all, and logging *people's* devices isn't the
-purpose of this tool (see §1 for what was declined and why). You are
-responsible for lawful, consented use. If a design question is "could this
-harbor a third party against their will?" — that feature is not getting
-merged, here or in forks.
+Everything here is scoped to infrastructure you own or explicitly authorise.
+All survey/IDS/audit/history features are **receive-only**. Passive monitoring
+of public airspace is permitted in most jurisdictions but not all, and
+logging *people's* devices isn't the purpose of this tool (see §1 for what was
+declined and why).
+
+The single transmitting command (`inject`) follows the same rule a licensed
+radio engineer follows when testing a network they operate: transmit only on
+your own airspace, minimally, logged, and with explicit consent. The
+deauth self-test briefly and reversibly disconnects **one device you name** if
+PMF is off — that is an authorised, low-impact verification of a security
+setting, the wireless equivalent of deliberately tripping your own fire
+alarm to confirm the sensor works. It is never pointed at third parties:
+broadcast targets and anything above the IDS flood threshold are refused in
+code. You remain responsible for lawful, consented use in your jurisdiction.
+
+If a design question is "could this harm a third party against their will?" —
+that feature is not getting merged, here or in forks.
 
 ## 20. Changelog
 
+* **v2.5.0** — Evil-Twin / rogue-AP *detection drill* (`inject --mode
+  evil-twin`). Beacons a network name YOU own from a fresh spoofed BSSID for
+  a hard-capped, self-terminating window (`--ssid`, `--security {open,wpa2}`,
+  `-c`, `--duration`), gated behind root + `--transmit --authorized --yes`
+  and fully audited. It is deliberately **beacon-only** — no probe-response,
+  authentication, association, DHCP or data path — so it is visible as a fake
+  AP yet cannot accept a client, capture a handshake/credential or relay
+  traffic; it exists purely to verify that `ids` unknown-bss warden alerts
+  and `scan` same-SSID/open-clone rogue heuristics fire. The drill is proven
+  end-to-end to trip both detectors. There is no functional rogue AP,
+  credential capture, karma or jamming in the codebase. **117 tests**.
+* **v2.4.0** — full deauthentication/disassociation test + IDS subtype fix.
+  `inject --mode deauth` sends a bounded, one-shot, **unicast** burst of
+  deauth and/or disassociation frames (`--frame-type {deauth,disassoc,both}`,
+  `--direction {ap-to-sta,sta-to-ap}`) at one client you own, gated behind
+  root + `--transmit --authorized --yes`, hard-capped per run, and fully
+  audited; reports whether the client was disconnected (enable 802.11w) or
+  protected. **Fixed a real IDS bug:** disassociation frames are management
+  subtype **10** but the watchdog matched `(12, 11)` — so disassociation
+  floods were *missed* and authentication frames (subtype 11) were wrongly
+  counted; the association branch also matched probe requests (subtype 4)
+  instead of reassociations (subtype 2). Both now match the IEEE subtypes;
+  the offline self-test adds a disassociation-flood signature. Dry runs
+  remain the default and emit nothing. **110 tests**.
+* **v2.3.0** — authorized packet injection for defensive self-test
+  (`inject.py` + `inject` command): offline zero-RF IDS signature self-test
+  (`--mode ids-selftest`, CI-safe); ordinary active probe scan; IDS/sensor
+  coverage **canary** markers; bounded, unicast, own-AP **PMF / deauth
+  resistance** test. Dry run by default; live emission gated behind root +
+  `--transmit` + `--authorized` (+ `--yes` for deauth); hard per-mode frame
+  caps below the IDS flood threshold; minimum inter-frame interval; broadcast
+  and third-party targets refused; 0600 owner-only `injection_audit.csv` for
+  every frame and a verification pcap. No flood, clone, jam or replay path.
+  **101 tests**.
 * **v2.2.0** — trust & privacy hardening (the 10 fixes, §21): central
   source+confidence trust model (`trust.py`); RF-observed vs router-confirmed
   census with per-binding evidence ranks; rotating-MAC honesty (observed-MAC

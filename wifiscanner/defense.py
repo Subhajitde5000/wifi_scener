@@ -168,7 +168,7 @@ class Watchdog:
         sta = (d.addr2 or "").upper()
         now = time.time()
 
-        if t == 0 and st in (12, 11):                     # deauth / disassoc
+        if t == 0 and st in (12, 10):            # deauth(12) / disassoc(10)
             self.deauth_by_ap[ap].append(now)
             self._trim(self.deauth_by_ap[ap])
             threshold = self.effective_flood_n + self._adaptive_margin()
@@ -178,9 +178,10 @@ class Watchdog:
                         else "on a BSS outside your baseline") if self.known \
                         else ""
                 conf = 70 if ap in self.known else (55 if baselined else 35)
+                kind = "disassociation" if st == 10 else "deauthentication"
                 self._fire("deauth-flood",
                            "high" if baselined else "info", ap,
-                           f"{len(self.deauth_by_ap[ap])} deauth/disassoc in "
+                           f"{len(self.deauth_by_ap[ap])} {kind}/disassoc in "
                            f"{self.window:.0f}s {note} - kick/redirect or "
                            f"handshake-harvest bait; PMF-required clients "
                            f"ignore forged management frames",
@@ -188,11 +189,12 @@ class Watchdog:
                            confidence=conf,
                            evidence=f"{len(self.deauth_by_ap[ap])}-in-"
                                     f"{self.window:.0f}s|threshold-{threshold}")
-            # remember for the forced-reauth chain (attacker kicks both ways)
+            # remember for the forced-reauth chain (attacker kicks both ways);
+            # both deauth and disassoc lead a victim to re-associate
             for other in (d.addr1, d.addr2):
                 if other:
                     self.last_deauth[(ap, other.upper())] = now
-        elif t == 0 and st in (0, 4):                     # (re)assoc request
+        elif t == 0 and st in (0, 2):                   # (re)assoc request
             self.last_assoc[(ap, sta)] = now
             td = self.last_deauth.get((ap, sta), 0.0)
             if now - td <= self.window:
