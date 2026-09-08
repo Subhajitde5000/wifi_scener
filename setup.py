@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="wifiscanner",
-    version="5.0.0",
+    version="5.1.0",
     description="Research-grade passive Wi-Fi survey, client attribution, laboratory & IDS platform",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

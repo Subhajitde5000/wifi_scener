@@ -968,6 +968,30 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--answers", default="", help="score: answers JSON file or '-' for stdin")
     ex.add_argument("--runs", default="", help="compare: comma-separated run ids")
 
+    # ---- unified research workstation (§6-10, §32-33)
+    rs = sub.add_parser("research", help="unified research workstation: projects, datasets, detectors, resources, evidence, hardware, web")
+    rs.add_argument("action", choices=["project-create", "project-list", "project-show",
+                                       "dataset-register", "dataset-list", "dataset-verify",
+                                       "feature-extract", "detector-list", "detector-test",
+                                       "benchmark", "resource-list", "resource-register", "resource-allocate", "resource-release",
+                                       "evidence-list", "hardware", "web", "stats-demo"],
+                    help="project-*=project lifecycle; dataset-*=registry; feature-extract=802.11 pipeline; detector-*=SDK; benchmark=compare detectors; resource-*=lab manager; evidence-*=ledger; hardware=capability probe; web=unified workstation")
+    rs.add_argument("--title", default="", help="project/dataset title")
+    rs.add_argument("--question", default="", help="research question")
+    rs.add_argument("--hypothesis", default="", help="hypothesis")
+    rs.add_argument("--owner", default="", help="owner/student id")
+    rs.add_argument("--project-id", default="", help="project id")
+    rs.add_argument("--dataset-id", default="", help="dataset id")
+    rs.add_argument("--artifact", default="", help="file/dir path for dataset/evidence")
+    rs.add_argument("--kind", default="", help="dataset kind or resource kind")
+    rs.add_argument("--provenance", default="", help="LIVE/CAPTURED/REPLAYED/SIMULATED/SYNTHETIC")
+    rs.add_argument("--pcap", default="", help="pcap path for feature extraction / benchmark")
+    rs.add_argument("--detector", default="", help="detector id for test/benchmark")
+    rs.add_argument("--db", default="research.sqlite", help="research DB path")
+    rs.add_argument("--bind", default="127.0.0.1", help="web: bind address")
+    rs.add_argument("--port", type=int, default=8830, help="web: port")
+    rs.add_argument("--token", default="", help="web: instructor token (auto if empty)")
+
     sub.add_parser("interfaces", help="list wireless interfaces and capabilities")
     return p
 
@@ -3607,6 +3631,233 @@ def cmd_rf_lab(args) -> int:
     return 2
 
 
+def cmd_research(args) -> int:
+    """Unified research workstation (§6-10, §32-33) — projects/datasets/features/detectors/benchmark/resources/evidence/hardware/web."""
+    import json as _json
+    from .research.projects import ProjectStore
+    from .research.datasets import DatasetStore
+    from .research.features import FeaturePipeline
+    from .research.detectors import DetectorRegistry, BUILTIN_DETECTORS
+    from .research.resources import ResourceManager
+    from .research.evidence import EvidenceStore
+    from .research.hardware import CapabilityProbe
+    from .research.benchmarks import BenchmarkSuite
+    from .research.stats import describe, confidence_interval
+
+    db = args.db or "research.sqlite"
+    act = args.action
+
+    if act == "project-create":
+        ps = ProjectStore(db)
+        title = args.title or "Untitled research project"
+        proj = ps.create(title=title, research_question=args.question, hypothesis=args.hypothesis, owner=args.owner)
+        print(f"project {proj.id} created: {proj.title!r} (owner={proj.owner or '-'})")
+        ps.close(); return 0
+    if act == "project-list":
+        ps = ProjectStore(db)
+        rows = ps.list()
+        from .display import print_rows as _pr
+        _pr(f"Research projects ({len(rows)})", [("ID","id"),("Title","title"),("Status","status"),("Owner","owner"),("Question","research_question")],
+            [dict(id=r.id, title=r.title[:36], status=r.status, owner=r.owner, research_question=r.research_question[:60]) for r in rows])
+        ps.close(); return 0
+    if act == "project-show":
+        if not args.project_id:
+            print("research project-show needs --project-id"); return 2
+        ps = ProjectStore(db)
+        p = ps.get(args.project_id)
+        if not p:
+            print(f"no such project {args.project_id!r}"); ps.close(); return 2
+        print(_json.dumps(p.to_dict(), indent=2))
+        exps = ps.experiments(p.id)
+        if exps:
+            print(f"\nlinked experiments ({len(exps)}):")
+            for e in exps: print(f"  {e['experiment_id']} / {e['run_id']}")
+        ps.close(); return 0
+
+    if act == "dataset-register":
+        ds = DatasetStore(db)
+        title = args.title or (args.artifact or "untitled")
+        prov = (args.provenance or "CAPTURED").upper()
+        kind = (args.kind or "captured").lower()
+        d = ds.register(title=title, kind=kind, provenance=prov, source=args.artifact or db, artifact_path=args.artifact)
+        print(f"dataset {d.id} registered v{d.version} [{d.provenance}/{d.kind}] sha={d.sha256[:12]}")
+        ds.close(); return 0
+    if act == "dataset-list":
+        ds = DatasetStore(db)
+        rows = ds.list()
+        from .display import print_rows as _pr2
+        _pr2(f"Datasets ({len(rows)})", [("ID","id"),("Title","title"),("Kind","kind"),("Provenance","provenance"),("SHA","sha256"),("Artifact","artifact_path")],
+            [dict(id=r.id[:12], title=r.title[:30], kind=r.kind, provenance=r.provenance, sha256=r.sha256[:10], artifact_path=r.artifact_path[:40]) for r in rows[:60]])
+        ds.close(); return 0
+    if act == "dataset-verify":
+        if not args.dataset_id:
+            print("research dataset-verify needs --dataset-id"); return 2
+        ds = DatasetStore(db)
+        ok = ds.verify(args.dataset_id)
+        d = ds.get(args.dataset_id)
+        print(f"{args.dataset_id}: {'OK' if ok else 'FAIL'}  sha={d.sha256 if d else 'unknown'}")
+        ds.close(); return 0 if ok else 1
+
+    if act == "feature-extract":
+        pcap = args.pcap or args.artifact
+        if not pcap:
+            print("research feature-extract needs --pcap FILE"); return 2
+        ds = DatasetStore(db)
+        pipe = FeaturePipeline()
+        try:
+            fd = pipe.extract_pcap(pcap)
+        except FileNotFoundError as exc:
+            print(exc); return 2
+        stored = pipe.to_dataset_store(fd, title=args.title or f"features:{pcap}", dataset_store=ds)
+        print(f"features: {len(fd.features)} frames from {pcap} -> dataset {stored.id}  sha={fd.sha256[:8]}")
+        print(f"  duration={fd.window_stats.get('duration_s')}s throughput={fd.window_stats.get('throughput_fps')} fps  by_type={fd.window_stats.get('by_type')}")
+        return 0
+
+    if act == "detector-list":
+        reg = DetectorRegistry()
+        for d in BUILTIN_DETECTORS:
+            try: reg.register(d)
+            except: pass
+        rows = reg.list()
+        from .display import print_rows as _pr3
+        _pr3(f"Detectors ({len(rows)})", [("ID","id"),("Title","title"),("Kind","kind"),("Version","version")],
+            [dict(id=d.id, title=d.title, kind=d.kind, version=d.version) for d in rows])
+        return 0
+
+    if act == "detector-test":
+        pcap = args.pcap or args.artifact
+        det_id = args.detector or "builtin-deauth-flood"
+        reg = DetectorRegistry()
+        for d in BUILTIN_DETECTORS:
+            try: reg.register(d)
+            except: pass
+        det = reg.get(det_id)
+        if not det:
+            print(f"unknown detector {det_id!r}; try: research detector-list"); return 2
+        feats=[]
+        if pcap:
+            from .research.features import FeaturePipeline as _FP
+            fd = _FP().extract_pcap(pcap)
+            feats = fd.features
+        else:
+            # synthetic smoke features
+            from .research.features import FrameFeatures as _FF
+            feats=[_FF(idx=0, ts=1.0, frame_type="mgmt", subtype=12, bssid="AA:BB:CC:DD:EE:FF")]
+        dets, metrics = det.run(feats)
+        print(f"detector {det.id} v{det.version} on {len(feats)} frames -> {len(dets)} detections {metrics}")
+        for d in dets[:10]:
+            print(f"  {d.ts:.3f} {d.kind} {d.bssid} conf={d.confidence}")
+        th = det.test_harness(feats)
+        print(f"test harness: {th}")
+        return 0
+
+    if act == "benchmark":
+        # Compare all builtins on same features
+        pcap = args.pcap or args.artifact
+        if not pcap:
+            print("research benchmark needs --pcap FILE (ground truth optional via --artifact ground_truth.json)"); return 2
+        fd = FeaturePipeline().extract_pcap(pcap)
+        reg = DetectorRegistry()
+        for d in BUILTIN_DETECTORS:
+            try: reg.register(d)
+            except: pass
+        suite = BenchmarkSuite()
+        for det in reg.list():
+            suite.run_detector(det, fd, dataset_id=pcap, dataset_version=fd.version)
+        rep = suite.compare()
+        print(f"benchmark on {pcap} ({len(fd.features)} frames):")
+        for r in rep.get("runs", []):
+            acc=r.get("accuracy",{})
+            overall=acc.get("overall",{}) if acc else {}
+            print(f"  {r['detector']:30} {r['detections']:3} detections  wall {r['latency_ms'].get('wall_ms')}ms  F1={overall.get('f1','n/a')}")
+        print("ranking:", " > ".join(rep.get("ranking", [])))
+        out = args.title or "benchmark_report.json"
+        suite.report(out)
+        print(f"report -> {out}")
+        return 0
+
+    if act == "resource-list":
+        rm = ResourceManager(db)
+        rows = rm.list()
+        from .display import print_rows as _pr4
+        _pr4(f"Lab resources ({len(rows)})", [("ID","id"),("Kind","kind"),("Name","name"),("Health","health"),("State","available")],
+            [dict(id=r.id[:12], kind=r.kind, name=r.name, health=r.health, available="free" if r.available else f"busy->{r.allocated_to[:8]}") for r in rows])
+        allocs = rm.allocations()
+        if allocs:
+            print(f"allocations ({len(allocs)}):")
+            for a in allocs[:10]:
+                print(f"  {a['token'][:12]}  {a['resource_id'][:12]} -> {a['run_id'][:12]}  age={round(__import__('time').time()-a['allocated_at'])}s  {'released' if a['released_at'] else 'active'}")
+        rm.close(); return 0
+    if act == "resource-register":
+        rm = ResourceManager(db)
+        kind = args.kind or "adapter"
+        name = args.title or "lab-resource"
+        res = rm.register(kind=kind, name=name, capabilities=["packet_capture"], config={})
+        print(f"resource {res.id} registered: {kind}/{name}")
+        rm.close(); return 0
+    if act == "resource-allocate":
+        if not args.dataset_id:
+            # repurpose --dataset-id as resource-id shorthand for CLI ergonomics
+            print("research resource-allocate needs --dataset-id <resource-id>  (--project-id holds run_id)"); return 2
+        rm = ResourceManager(db)
+        tok = rm.allocate(args.dataset_id, args.project_id or "exp-1", args.title or "run-1")
+        print(f"allocated {args.dataset_id} -> token {tok}")
+        rm.close(); return 0
+    if act == "resource-release":
+        rm = ResourceManager(db)
+        ok = rm.release(args.dataset_id or args.title)
+        print("released" if ok else "not found")
+        rm.close(); return 0
+
+    if act == "evidence-list":
+        es = EvidenceStore(db)
+        rows = es.list(project_id=args.project_id, run_id=args.dataset_id)
+        from .display import print_rows as _pr5
+        _pr5(f"Evidence ({len(rows)})", [("ID","id"),("Kind","kind"),("Title","title"),("Provenance","provenance"),("SHA","sha256")],
+            [dict(id=e.id[:12], kind=e.kind, title=e.title[:36], provenance=e.provenance, sha256=e.sha256[:10]) for e in rows[:60]])
+        es.close(); return 0
+
+    if act == "hardware":
+        cp = CapabilityProbe()
+        rpt = cp.report()
+        import json as _j
+        print(_j.dumps(rpt, indent=2))
+        return 0
+
+    if act == "web":
+        from .research.web import ResearchApp, make_research_server
+        app = ResearchApp(db_path=db)
+        srv = make_research_server(args.bind, args.port, app)
+        host = "localhost" if args.bind in ("127.0.0.1","::1") else args.bind
+        print(f"research workstation : http://{host}:{args.port}/")
+        print(f"instructor console   : http://{host}:{args.port}/instructor?token={app.token}  (keep private)")
+        import threading as _th, time as _time
+        # background reaper
+        def _reap():
+            while True:
+                _time.sleep(30)
+                try: app.resources.reap_orphans()
+                except: pass
+        _th.Thread(target=_reap, daemon=True).start()
+        try:
+            srv.serve_forever(poll_interval=0.5)
+        except KeyboardInterrupt:
+            print("\nstopping research workstation...")
+        finally:
+            srv.server_close()
+        return 0
+
+    if act == "stats-demo":
+        import random as _r
+        rnd=_r.Random(42)
+        samples=[rnd.gauss(20, 5) for _ in range(50)]
+        print("samples:", [round(x,1) for x in samples[:10]], "...")
+        print("describe:", describe(samples))
+        print("CI 95%:", confidence_interval(samples))
+        return 0
+
+    print(f"unknown research action {act!r}"); return 2
+
 def cmd_handshake_lab(args) -> int:
     from . import hsaudit as H
     if args.action == "make-dataset":
@@ -3810,6 +4061,7 @@ def main(argv=None) -> int:
           "scan-lab": cmd_scan_lab, "cred-lab": cmd_cred_lab,
     "priv-lab": cmd_priv_lab, "rf-lab": cmd_rf_lab,
     "handshake-lab": cmd_handshake_lab,
+          "research": cmd_research,
           "experiment": cmd_experiment}[args.cmd]
     try:
         return fn(args)

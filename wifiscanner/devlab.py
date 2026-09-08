@@ -274,7 +274,14 @@ def generate_maclab_dataset(outdir: str, seed: int = 8, fresh: bool = False):
     os.makedirs(outdir, exist_ok=True)
     rnd = __import__("random").Random(seed)
     sensors = ["lab-a", "corridor"]
-    start = int(time.time() - 2 * 86400) // 60 * 60
+    # Align to local midnight so weekday arithmetic matches the
+    # intended 09:00/12:30 schedule (otherwise 09:00 lands at 02:42 and
+    # the weekday test fails).
+    _now = time.time()
+    _midnight = int(time.mktime(time.strptime(
+        time.strftime("%Y-%m-%d", time.localtime(_now)),
+        "%Y-%m-%d")))
+    start = _midnight - 2 * 86400
     records = defaultdict(list)
     truth = []
 
@@ -399,7 +406,14 @@ def generate_tracklab_dataset(outdir: str, seed: int = 9, days: int = 14,
     os.makedirs(outdir, exist_ok=True)
     rnd = __import__("random").Random(seed)
     # anchor the dataset to end ~1h ago so `--since -2d` windows it well
-    end = int(time.time() - 3600) // 60 * 60
+    # Align days to local midnight so the 09:00 lab-north visit is really
+    # 09:00 and weekdays are correct (otherwise start at 17:42 shifts every
+    # visit to 02:42 next day).
+    _now = time.time()
+    _midnight = int(time.mktime(time.strptime(
+        time.strftime("%Y-%m-%d", time.localtime(_now)),
+        "%Y-%m-%d")))
+    end = _midnight  # midnight today (local)
     start = end - days * 86400
     sensors = ["lab-north", "lab-south", "corridor", "canteen"]
     records = defaultdict(list)

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "arena/**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (no mandatory deps; optional for pcap paths)
+        run: |
+          python -m pip install --upgrade pip
+          pip install scapy rich || true
+      - name: Unit tests (all 121)
+        run: |
+          python -m unittest discover -s tests -v
+      - name: Research CLI smoke
+        run: |
+          python -m wifiscanner.cli -q research hardware
+          python -m wifiscanner.cli -q research project-create --title "CI smoke" --owner ci --db /tmp/ci.sqlite
+          python -m wifiscanner.cli -q research dataset-register --title "fixture" --artifact tests/fixture.pcap --provenance CAPTURED --db /tmp/ci.sqlite
+          python -m wifiscanner.cli -q research feature-extract --pcap tests/fixture.pcap --db /tmp/ci.sqlite
+          python -m wifiscanner.cli -q research detector-list --db /tmp/ci.sqlite
+          python -m wifiscanner.cli -q experiment list --db /tmp/exp.sqlite
+      - name: Check imports (no circular)
+        run: |
+          python -c "from wifiscanner.research import ProjectStore, DatasetStore, FeaturePipeline, DetectorRegistry, ResourceManager, EvidenceStore; print('research imports ok')"
+          python -m py_compile wifiscanner/research/web.py wifiscanner/research/hardware.py
