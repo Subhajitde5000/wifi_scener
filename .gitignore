@@ -23,3 +23,6 @@ wifi-*.md
 
 # os
 .DS_Store
+
+# runtime lab sqlite logs (never commit)
+*.sqlite
