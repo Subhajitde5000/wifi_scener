@@ -955,6 +955,19 @@ def build_parser() -> argparse.ArgumentParser:
     hsh.add_argument("--duration", type=float, default=0.0)
     hsh.add_argument("--quiet", action="store_true")
 
+    ex = sub.add_parser(
+        "experiment", help="research-grade experiment engine: lifecycle, analytics, comparison")
+    ex.add_argument("action",
+                    choices=["list", "catalogue", "start", "status", "score", "compare", "analytics", "reset"],
+                    help="list = definitions; catalogue = bootstrap; start = new run; status = run detail")
+    ex.add_argument("--id", default="", help="experiment id (e.g. wireless-ids-001)")
+    ex.add_argument("--run-id", default="", help="run id for status/score/analytics")
+    ex.add_argument("--db", default="experiments.sqlite", help="experiment engine DB")
+    ex.add_argument("--seed", type=int, default=0, help="reproducibility seed (0 = random)")
+    ex.add_argument("--config", default="", help="JSON config string or @file.json")
+    ex.add_argument("--answers", default="", help="score: answers JSON file or '-' for stdin")
+    ex.add_argument("--runs", default="", help="compare: comma-separated run ids")
+
     sub.add_parser("interfaces", help="list wireless interfaces and capabilities")
     return p
 
@@ -3649,6 +3662,113 @@ def cmd_handshake_lab(args) -> int:
     return 2
 
 
+def cmd_experiment(args) -> int:
+    """Unified research-grade experiment engine CLI."""
+    import json as _json
+    from .experiment import ExperimentEngine, bootstrap_catalogue
+    eng = ExperimentEngine(args.db)
+    try:
+        if args.action in ("catalogue", "list") and args.action == "catalogue":
+            n = bootstrap_catalogue(eng)
+            print(f"catalogue bootstrapped: {n} experiment definitions in {args.db}")
+            return 0
+        if args.action == "list":
+            bootstrap_catalogue(eng)
+            defs = eng.list_definitions()
+            from .display import print_rows as _pr
+            _pr("Experiment catalogue (research-grade)",
+                [("ID", "id"), ("Title", "title"), ("Category", "category"),
+                 ("Provenance", "data_provenance")],
+                [d.to_dict() for d in defs])
+            print(f"\n{len(defs)} experiments — run: wifiscanner experiment start --id <ID> --config '{{\"key\": \"val\"}}'")
+            return 0
+        if args.action == "start":
+            if not args.id:
+                print("experiment start needs --id <experiment-id> (see: experiment list)")
+                return 2
+            bootstrap_catalogue(eng)
+            cfg = {}
+            if args.config:
+                if args.config.startswith("@"):
+                    with open(args.config[1:], encoding="utf-8") as fh:
+                        cfg = _json.load(fh)
+                else:
+                    cfg = _json.loads(args.config)
+            run = eng.start(args.id, config=cfg, seed=args.seed or None)
+            print(f"started run {run.id} for {args.id} (seed={run.seed})")
+            print(f"  config: {run.config}")
+            print(f"  reproducibility hash: {run.reproducibility_hash}")
+            # demonstrate full lifecycle hook: timeline already has START+CONFIG
+            eng.finish(run, result={"demo": True, "note": "use Python API eng.finish() with real results"})
+            print(f"  timeline events: {len(run.timeline)} (START→CONFIG→RESULT skeleton)")
+            print(f"  status: {run.status} — extend via Python API: ExperimentEngine('{args.db}')")
+            return 0
+        if args.action == "status":
+            if not args.run_id:
+                runs = eng.list_runs(args.id, limit=20)
+                from .display import print_rows as _pr2
+                _pr2(f"Recent runs ({len(runs)})",
+                     [("Run", "id"), ("Exp", "experiment_id"), ("Status", "status"),
+                      ("Duration", "duration_s"), ("Seed", "seed")],
+                     [{"id": r.id[:16]+"…", "experiment_id": r.experiment_id,
+                       "status": r.status, "duration_s": r.duration_s, "seed": r.seed} for r in runs])
+                return 0
+            run = eng.get_run(args.run_id)
+            if not run:
+                print(f"no such run {args.run_id!r}")
+                return 2
+            print(f"Run {run.id} — {run.experiment_id} [{run.status}] seed={run.seed} hash={run.reproducibility_hash}")
+            for e in run.timeline:
+                print(f"  [{e.phase:8}] {e.detail[:100]}")
+            if run.result:
+                print(f"  result: {run.result}")
+            if run.score:
+                print(f"  score: {run.score}")
+            return 0
+        if args.action == "score":
+            if not args.run_id or not args.answers:
+                print("experiment score needs --run-id and --answers file.json or '-'")
+                return 2
+            raw = sys.stdin.read() if args.answers == "-" else open(args.answers, encoding="utf-8").read()
+            answers = _json.loads(raw)
+            r = eng.score(args.id or eng.get_run(args.run_id).experiment_id, args.run_id, answers)
+            print(f"score: {r['score']}/100")
+            for fb in r["feedback"]:
+                print(f"  {fb}")
+            return 0 if r["score"] >= 60 else 1
+        if args.action == "compare":
+            ids = [x.strip() for x in args.runs.split(",") if x.strip()]
+            if len(ids) < 2:
+                print("experiment compare needs --runs id1,id2,... (at least 2)")
+                return 2
+            cmp = eng.compare_runs(ids)
+            print(f"Comparing {len(ids)} runs:")
+            for rid, mets in cmp.get("metrics", {}).items():
+                print(f"  {rid}: {len(mets)} metrics")
+            for k, v in cmp.get("comparison", {}).items():
+                print(f"  {k}: {v}")
+            return 0
+        if args.action == "analytics":
+            if not args.run_id:
+                print("experiment analytics needs --run-id")
+                return 2
+            mets = eng.get_metrics(args.run_id)
+            print(f"Metrics for {args.run_id} ({len(mets)} points):")
+            for m in mets:
+                print(f"  {m['metric']}: {m['value']} {m['meta']}")
+            return 0
+        if args.action == "reset":
+            if not args.run_id:
+                print("experiment reset needs --run-id")
+                return 2
+            r = eng.reset(args.run_id)
+            print(f"reset {args.run_id}: {r.status if r else 'not found'}")
+            return 0 if r else 2
+        return 2
+    finally:
+        eng.close()
+
+
 def cmd_interfaces(args) -> int:
     ifaces = survey.list_interfaces()
     print(f"platform      : {os_name()}")
@@ -3689,7 +3809,8 @@ def main(argv=None) -> int:
           "response-lab": cmd_response_lab,
           "scan-lab": cmd_scan_lab, "cred-lab": cmd_cred_lab,
     "priv-lab": cmd_priv_lab, "rf-lab": cmd_rf_lab,
-    "handshake-lab": cmd_handshake_lab}[args.cmd]
+    "handshake-lab": cmd_handshake_lab,
+          "experiment": cmd_experiment}[args.cmd]
     try:
         return fn(args)
     except KeyboardInterrupt:
