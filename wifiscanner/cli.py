@@ -40,6 +40,20 @@ LEGAL = (
 )
 
 
+def cmd_research_ui(args) -> int:
+    from wifiscanner.research.ui import start_ui_server
+    db_path = f"sqlite:///{args.db}" if getattr(args, "db", None) else "sqlite:///research_labs.sqlite"
+    try:
+        start_ui_server(db_path, args.bind, args.port)
+    except KeyboardInterrupt:
+        print("\nResearch UI stopped.")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"Failed to start UI: {e}")
+        return 1
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wifiscanner",
@@ -956,6 +970,12 @@ def build_parser() -> argparse.ArgumentParser:
     hsh.add_argument("--quiet", action="store_true")
 
     sub.add_parser("interfaces", help="list wireless interfaces and capabilities")
+    
+    p_rui = sub.add_parser("research-ui", help="Start the Research Platform Workstation UI")
+    p_rui.add_argument("--port", type=int, default=8830)
+    p_rui.add_argument("--bind", default="0.0.0.0")
+    p_rui.add_argument("--db", help="Path to sqlite db (default: research_labs.sqlite)")
+    
     return p
 
 
@@ -1629,11 +1649,44 @@ def cmd_traffic(args) -> int:
 # ------------------------------------------------- defense & education
 
 def cmd_ids(args) -> int:
+    from wifiscanner.defense import Watchdog
+    from wifiscanner.store import Store
+    from wifiscanner.research.integrations import IDSResearchAdapter
+    from wifiscanner.research import DatabaseManager, EventBus, ResourceManager, ExperimentManager
+    
+    # Initialize the new Research Platform backend
+    db = DatabaseManager("sqlite:///research_ids.sqlite")
+    db.initialize_schema()
+    event_bus = EventBus(db)
+    resource_mgr = ResourceManager(db)
+    exp_mgr = ExperimentManager(db, event_bus, resource_mgr)
+    
+    adapter = IDSResearchAdapter(db, event_bus, resource_mgr, exp_mgr)
+    project_id = db.SessionLocal().execute(
+        __import__("sqlalchemy").text("SELECT id FROM research_projects LIMIT 1")
+    ).scalar()
+    if not project_id:
+        from wifiscanner.research import ProjectManager
+        pm = ProjectManager(db)
+        project_id = pm.create_project("Default IDS Project")
+        
+    exp_id = adapter.setup_ids_experiment(
+        project_id=project_id,
+        interface=args.interface or "pcap",
+        window=args.window,
+        flood=args.flood,
+        sensitivity=args.sensitivity
+    )
+    
+    event_bus.start()
+    
     wd = Watchdog(window_s=args.window, flood_frames=args.flood,
                   sensitivity=args.sensitivity)
     print(f"IDS sensitivity: {args.sensitivity} "
           f"(effective flood threshold {wd.effective_flood_n} frames; "
           f"adaptive margin raises it automatically in noisy air)")
+    print(f"Research Platform initialized. Experiment ID: {exp_id}")
+
     known: set = set()
     st = None
     if args.db:
@@ -1641,14 +1694,26 @@ def cmd_ids(args) -> int:
         known = {r["bssid"] for r in st.warden_list()}
     wd.known = known or wd.known
     fired = [0]
+    
+    def process_pkt(pkt):
+        wd.feed(pkt)
+        if pkt.haslayer("Dot11"):
+            event_bus.publish(
+                source="sniffer",
+                event_type="frame.captured",
+                payload={"len": len(pkt), "time": float(pkt.time)},
+                experiment_id=exp_id,
+                persist=False 
+            )
 
     if args.pcap:
         if not sniffer.scapy_available():
             log.error("scapy required for pcap analysis")
             return 2
         from scapy.all import PcapReader
+        adapter.start_live_ids(exp_id)
         for pkt in PcapReader(args.pcap):
-            wd.feed(pkt)
+            process_pkt(pkt)
         log.info("analysed %s", args.pcap)
     else:
         if not sniffer.scapy_available():
@@ -1663,13 +1728,26 @@ def cmd_ids(args) -> int:
             iface = ifaces[0]["name"]
         sn = sniffer.MonitorSniffer(iface, hop_interval=0.35)
 
+        try:
+            adapter.start_live_ids(exp_id)
+        except Exception as e:
+            log.error(f"Resource allocation failed: {e}")
+            return 1
+
         def cb(pkt):
             try:
-                wd.feed(pkt)
+                process_pkt(pkt)
             except Exception:
                 pass
             if args.follow and len(wd.alerts) > fired[0]:
                 for a in wd.alerts[fired[0]:]:
+                    event_bus.publish(
+                        source="WatchdogIDS",
+                        event_type="ids.alert",
+                        severity=a.severity,
+                        payload=a.to_row(),
+                        experiment_id=exp_id
+                    )
                     print(f"[{a.severity.upper():8}] {a.kind}: {a.detail}")
                 fired[0] = len(wd.alerts)
         if args.no_monitor_setup:
@@ -1681,6 +1759,9 @@ def cmd_ids(args) -> int:
             with sniffer.MonitorMode(iface, use_airmon=args.airmon) as mon:
                 sn.iface = mon
                 sn.run(args.duration, on_packet=cb)
+
+    adapter.stop_ids(exp_id)
+    event_bus.stop()
 
     alerts = wd.results()
     if args.learn and st is not None:
@@ -2243,6 +2324,16 @@ def cmd_lab(args) -> int:
 def cmd_wpa_lab(args) -> int:
     """WPA/WPA2/WPA3 decryption laboratory (offline, lab captures only)."""
     from . import wpalab as wl
+    from wifiscanner.research import DatabaseManager, EventBus, ResourceManager, ExperimentManager, DatasetManager, ProjectManager
+    from wifiscanner.research.lab_integrations import WPALabResearchAdapter
+    
+    db = DatabaseManager("sqlite:///research_labs.sqlite")
+    db.initialize_schema()
+    event_bus = EventBus(db)
+    exp_mgr = ExperimentManager(db, event_bus, ResourceManager(db))
+    dataset_mgr = DatasetManager(db)
+    pm = ProjectManager(db)
+    adapter = WPALabResearchAdapter(db, exp_mgr, dataset_mgr)
 
     # ------------------------------------------------ instructor: fixtures
     if args.action == "make-fixture":
@@ -2256,8 +2347,18 @@ def cmd_wpa_lab(args) -> int:
                                cipher=args.cipher, channel=args.channel,
                                include_handshake=not args.no_handshake,
                                include_plaintext_tail=not args.no_plaintext)
+                               
+        project_id = db.SessionLocal().execute(__import__("sqlalchemy").text("SELECT id FROM research_projects LIMIT 1")).scalar()
+        if not project_id:
+            project_id = pm.create_project("WPA Cryptography Project")
+            
+        ds_id = adapter.import_fixture_as_dataset(args.pcap, meta)
+        
         print(f"laboratory capture written: {meta['path']} "
               f"({meta['frames']} frames)")
+        query = f"SELECT checksum FROM research_datasets WHERE id='{ds_id}'"
+        chk = dataset_mgr.db.SessionLocal().execute(__import__("sqlalchemy").text(query)).scalar()
+        print(f"[Research Platform] Registered as Dataset ID: {ds_id} (Checksum: {chk})")
         print(f"  SSID:       {meta['ssid']}")
         print(f"  AP:         {meta['ap']}   client: {meta['sta']}")
         print(f"  cipher:     {meta['cipher']}   channel: {args.channel}")
@@ -2511,6 +2612,16 @@ def cmd_mac_lab(args) -> int:
     """MAC randomization & deanonymization laboratory."""
     import json as _json
     from . import devlab as dl
+    from wifiscanner.research import DatabaseManager, EventBus, ResourceManager, ExperimentManager, DatasetManager, ProjectManager
+    from wifiscanner.research.lab_integrations import TrackLabResearchAdapter
+
+    db = DatabaseManager("sqlite:///research_labs.sqlite")
+    db.initialize_schema()
+    event_bus = EventBus(db)
+    exp_mgr = ExperimentManager(db, event_bus, ResourceManager(db))
+    dataset_mgr = DatasetManager(db)
+    pm = ProjectManager(db)
+    adapter = TrackLabResearchAdapter(db, exp_mgr, dataset_mgr)
 
     if args.action == "make-dataset":
         if not args.dataset:
@@ -2519,9 +2630,17 @@ def cmd_mac_lab(args) -> int:
             return 2
         meta = dl.generate_maclab_dataset(args.dataset, seed=args.seed,
                                           fresh=args.fresh)
+                                          
+        project_id = db.SessionLocal().execute(__import__("sqlalchemy").text("SELECT id FROM research_projects LIMIT 1")).scalar()
+        if not project_id:
+            project_id = pm.create_project("MAC Randomization Deanonymization")
+            
+        ds_id = adapter.import_tracking_dataset(args.dataset, meta)
+        
         print(f"dataset written: {args.dataset} "
               f"({meta['frames']} frames; sensors: "
               f"{', '.join(meta['sensors'])}; 2-day span)")
+        print(f"[Research Platform] Registered as Dataset ID: {ds_id}")
         print(f"  sensor pcaps : "
               f"{', '.join('sensor-' + s + '.pcap' for s in meta['sensors'])}")
         print(f"  ground truth : {args.dataset}/ground-truth.csv "
@@ -2671,6 +2790,16 @@ def cmd_track_lab(args) -> int:
     """Long-term device tracking & privacy laboratory."""
     import json as _json
     from . import devlab as dl
+    from wifiscanner.research import DatabaseManager, EventBus, ResourceManager, ExperimentManager, DatasetManager, ProjectManager
+    from wifiscanner.research.lab_integrations import TrackLabResearchAdapter
+
+    db = DatabaseManager("sqlite:///research_labs.sqlite")
+    db.initialize_schema()
+    event_bus = EventBus(db)
+    exp_mgr = ExperimentManager(db, event_bus, ResourceManager(db))
+    dataset_mgr = DatasetManager(db)
+    pm = ProjectManager(db)
+    adapter = TrackLabResearchAdapter(db, exp_mgr, dataset_mgr)
 
     if args.action == "make-dataset":
         if not args.dataset:
@@ -2679,8 +2808,16 @@ def cmd_track_lab(args) -> int:
             return 2
         meta = dl.generate_tracklab_dataset(args.dataset, seed=args.seed,
                                             days=args.days, fresh=args.fresh)
+                                            
+        project_id = db.SessionLocal().execute(__import__("sqlalchemy").text("SELECT id FROM research_projects LIMIT 1")).scalar()
+        if not project_id:
+            project_id = pm.create_project("Tracking and Privacy Research")
+            
+        ds_id = adapter.import_tracking_dataset(args.dataset, meta)
+        
         print(f"dataset written: {args.dataset} ({meta['frames']} frames, "
               f"{meta['days']} days, sensors: {', '.join(meta['sensors'])})")
+        print(f"[Research Platform] Registered as Dataset ID: {ds_id}")
         print(f"  ground truth : {args.dataset}/ground-truth.csv "
               f"(instructor-only, 0600)")
         print("\nDevices woven in:")
@@ -3689,7 +3826,7 @@ def main(argv=None) -> int:
           "response-lab": cmd_response_lab,
           "scan-lab": cmd_scan_lab, "cred-lab": cmd_cred_lab,
     "priv-lab": cmd_priv_lab, "rf-lab": cmd_rf_lab,
-    "handshake-lab": cmd_handshake_lab}[args.cmd]
+    "handshake-lab": cmd_handshake_lab, "research-ui": cmd_research_ui}[args.cmd]
     try:
         return fn(args)
     except KeyboardInterrupt:

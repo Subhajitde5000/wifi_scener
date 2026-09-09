@@ -3,3 +3,4 @@
 
 scapy>=2.5.0      # monitor-mode 802.11 sniffing + client attribution + pcap
 rich>=13.0.0      # colourised terminal tables and dashboards
+SQLAlchemy>=2.0.0

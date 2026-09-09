@@ -398,8 +398,11 @@ def generate_tracklab_dataset(outdir: str, seed: int = 9, days: int = 14,
         raise FileExistsError(f"{outdir} is not empty (pass --fresh)")
     os.makedirs(outdir, exist_ok=True)
     rnd = __import__("random").Random(seed)
-    # anchor the dataset to end ~1h ago so `--since -2d` windows it well
-    end = int(time.time() - 3600) // 60 * 60
+    # anchor the dataset to end ~1h ago, aligned to local midnight
+    now = time.time()
+    lt = time.localtime(now)
+    # align 'end' to local midnight
+    end = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
     start = end - days * 86400
     sensors = ["lab-north", "lab-south", "corridor", "canteen"]
     records = defaultdict(list)

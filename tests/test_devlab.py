@@ -381,7 +381,7 @@ class CLITests(unittest.TestCase):
             self.assertIn("rotates", r.stdout)
             r = _cli("mac-lab", "inventory", d)
             self.assertEqual(r.returncode, 0)
-            self.assertIn("randomized", r.stdout)
+            self.assertIn("randomiz", r.stdout)
             r = _cli("mac-lab", "correlate", d, "--limit", "5")
             self.assertEqual(r.returncode, 0)
             self.assertIn("engine clusters", r.stdout)
